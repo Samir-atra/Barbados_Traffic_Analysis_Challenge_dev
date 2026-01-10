@@ -1,4 +1,5 @@
-"""Module implementing the Forward-Forward algorithm for traffic prediction.
+"""
+Module implementing the Forward-Forward algorithm for traffic prediction.
 
 This script processes the Barbados Traffic dataset for 'Norman Niles #1' 
 and uses the Forward-Forward algorithm to learn representations and 
