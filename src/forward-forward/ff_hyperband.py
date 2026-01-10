@@ -1,27 +1,15 @@
-"""Module implementing the Forward-Forward algorithm for traffic prediction.
-
-Restructured to:
-1. Train on sequential blocks from Train.csv.
-2. Predict the future 5 states (Enter/Exit congestion) for each sequence.
-3. Validate on a dedicated split.
-4. Perform inference on TestInputSegments.csv.
-"""
+"""Module to perform hyperparameter tuning for the Forward-Forward algorithm using Hyperband."""
 
 import os
-import matplotlib
-matplotlib.use('Agg')
-
-os.environ["KERAS_BACKEND"] = "tensorflow"
-
+import random
+import numpy as np
+import pandas as pd
 import tensorflow as tf
 import keras
 from keras import ops
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score
+import keras_tuner as kt
 from tensorflow.compiler.tf2xla.python import xla
-import random
+from sklearn.metrics import accuracy_score
 
 # Set seeds for reproducibility
 SEED = 42
@@ -65,7 +53,7 @@ def get_features_and_labels(df):
     features = np.concatenate([
         df[['hour', 'minute', 'day_of_week', 'seg_id_norm', 'view_id']].values,
         view_1hot
-    ], axis=1).astype('float32') # 5 base + 4 1-hot = 9 features
+    ], axis=1).astype('float32')
     
     return features, df['joint_label'].values
 
@@ -96,18 +84,21 @@ def create_sequential_dataset(csv_path):
 # --- Forward-Forward Classes ---
 
 class FFDense(keras.layers.Layer):
-    def __init__(self, units, num_epochs=60, kernel_regularizer=None, **kwargs):
+    def __init__(self, units, num_epochs=60, threshold=1.5, learning_rate=0.003, kernel_regularizer=None, **kwargs):
         super().__init__(**kwargs)
+        self.units = units
+        self.num_epochs = num_epochs
+        self.threshold = threshold
+        self.learning_rate = learning_rate
+        self.kernel_regularizer = kernel_regularizer
         self.dense = keras.layers.Dense(
             units=units, 
             kernel_regularizer=kernel_regularizer,
             kernel_initializer=keras.initializers.GlorotUniform(seed=SEED)
         )
         self.relu = keras.layers.ReLU()
-        self.optimizer = keras.optimizers.Adam(0.003)
+        self.optimizer = keras.optimizers.Adam(learning_rate)
         self.loss_metric = keras.metrics.Mean()
-        self.threshold = 1.5
-        self.num_epochs = num_epochs
 
     def call(self, x):
         x_norm = ops.norm(x, ord=2, axis=1, keepdims=True) + 1e-4
@@ -127,7 +118,6 @@ class FFDense(keras.layers.Layer):
                 
                 loss = ops.concatenate([loss_pos, loss_neg], 0)
                 mean_loss = ops.cast(ops.mean(loss), dtype="float32")
-                # Add regularization losses
                 if self.dense.losses:
                     mean_loss += ops.sum(self.dense.losses)
                 self.loss_metric.update_state([mean_loss])
@@ -136,17 +126,19 @@ class FFDense(keras.layers.Layer):
         return ops.stop_gradient(self.call(x_pos)), ops.stop_gradient(self.call(x_neg)), self.loss_metric.result()
 
 class FFNetwork(keras.Model):
-    def __init__(self, dims, kernel_regularizer=None, **kwargs):
+    def __init__(self, dims, layer_epochs=60, threshold=1.5, learning_rate=0.003, kernel_regularizer=None, **kwargs):
         super().__init__(**kwargs)
         self.loss_var = keras.Variable(0.0, trainable=False)
         self.loss_count = keras.Variable(0.0, trainable=False)
-        self.ff_layers = [FFDense(d, kernel_regularizer=kernel_regularizer) for d in dims[1:]]
+        self.ff_layers = [
+            FFDense(d, num_epochs=layer_epochs, threshold=threshold, learning_rate=learning_rate, kernel_regularizer=kernel_regularizer) 
+            for d in dims[1:]
+        ]
         self.acc_tracker = keras.metrics.SparseCategoricalAccuracy(name="acc")
         self.f1_tracker = keras.metrics.F1Score(name="f1", average="macro")
 
     @property
     def metrics(self):
-        """Returns the model's metrics for tracking."""
         return [self.acc_tracker, self.f1_tracker]
 
     def overlay_y_on_x(self, data):
@@ -157,11 +149,9 @@ class FFNetwork(keras.Model):
 
     @tf.function
     def predict_batch(self, x):
-        """Predicts labels for a batch of inputs using vectorized_map."""
         return ops.vectorized_map(self.predict_one, x)
 
     def train_step(self, data):
-        # Unpack data which might include sample_weight from fit(class_weight=...)
         if len(data) == 3:
             x, y, sample_weight = data
         else:
@@ -169,8 +159,6 @@ class FFNetwork(keras.Model):
             sample_weight = None
 
         x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
-        
-        # Use a deterministic shuffle for the negative pass
         indices = tf.range(start=0, limit=tf.shape(y)[0], dtype=tf.int32)
         shuffled_indices = tf.random.experimental.stateless_shuffle(indices, seed=[SEED, SEED])
         x_neg, _ = ops.vectorized_map(self.overlay_y_on_x, (x, tf.gather(y, shuffled_indices)))
@@ -184,7 +172,6 @@ class FFNetwork(keras.Model):
             self.loss_var.assign_add(loss)
             self.loss_count.assign_add(1.0)
         
-        # Update training metrics
         y_pred = self.predict_batch(x)
         y_pred_1hot = ops.one_hot(y_pred, 16)
         self.acc_tracker.update_state(y, y_pred_1hot)
@@ -197,17 +184,13 @@ class FFNetwork(keras.Model):
         }
 
     def test_step(self, data):
-        """Custom test step for validation set evaluation."""
         if len(data) == 3:
             x, y, sample_weight = data
         else:
             x, y = data
             sample_weight = None
         
-        # Calculate goodness-based loss for validation (layer-wise average)
         x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
-        
-        # Deterministic shuffle for validation negative pass
         indices = tf.range(start=0, limit=tf.shape(y)[0], dtype=tf.int32)
         shuffled_indices = tf.random.experimental.stateless_shuffle(indices, seed=[SEED, SEED])
         x_neg, _ = ops.vectorized_map(self.overlay_y_on_x, (x, tf.gather(y, shuffled_indices)))
@@ -219,27 +202,19 @@ class FFNetwork(keras.Model):
             g_neg = ops.mean(ops.power(layer(h_neg), 2), 1)
             loss_pos = ops.log(1 + ops.exp(-g_pos + layer.threshold))
             loss_neg = ops.log(1 + ops.exp(g_neg - layer.threshold))
-            
             if sample_weight is not None:
                 loss_pos = loss_pos * ops.cast(sample_weight, loss_pos.dtype)
-
             layer_loss = ops.mean(ops.concatenate([loss_pos, loss_neg], 0))
             v_loss += ops.cast(layer_loss, "float32")
-            # Next layer inputs
             h_pos = ops.stop_gradient(layer(h_pos))
             h_neg = ops.stop_gradient(layer(h_neg))
         
         v_loss /= len(self.ff_layers)
-
         y_pred = self.predict_batch(x)
         y_pred_1hot = ops.one_hot(y_pred, 16)
         self.acc_tracker.update_state(y, y_pred_1hot)
         self.f1_tracker.update_state(ops.one_hot(y, 16), y_pred_1hot)
-        return {
-            "loss": v_loss,
-            "acc": self.acc_tracker.result(),
-            "f1": self.f1_tracker.result()
-        }
+        return {"loss": v_loss, "acc": self.acc_tracker.result(), "f1": self.f1_tracker.result()}
 
     def predict_one(self, x):
         h_all = []
@@ -247,24 +222,46 @@ class FFNetwork(keras.Model):
             h, _ = self.overlay_y_on_x((x, label))
             h_all.append(h)
         h_all = ops.stack(h_all)
-        
-        goodness = []
         h = h_all
+        goodness = []
         for layer in self.ff_layers:
             h = layer(h)
             goodness.append(ops.mean(ops.power(h, 2), 1))
-        
         total_goodness = ops.sum(ops.stack(goodness), 0)
         return ops.cast(ops.argmax(total_goodness), "int32")
 
-# --- Main ---
+# --- Keras Tuner Integration ---
+
+def build_model(hp):
+    num_layers = hp.Int("num_layers", 1, 5)
+    units = hp.Choice("units", [256, 512, 768, 1024])
+    learning_rate = hp.Float("learning_rate", 1e-4, 1e-2, sampling="log")
+    threshold = hp.Float("threshold", 1.0, 3.0)
+    layer_epochs = hp.Int("layer_epochs", 30, 100)
+    l2_reg = hp.Float("l2_reg", 1e-5, 1e-2, sampling="log")
+    
+    dims = [25] + [units] * num_layers
+    reg = keras.regularizers.L2(l2_reg)
+    
+    model = FFNetwork(
+        dims=dims,
+        layer_epochs=layer_epochs,
+        threshold=threshold,
+        learning_rate=learning_rate,
+        kernel_regularizer=reg
+    )
+    
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate),
+        jit_compile=False,
+        metrics=["acc", "f1"]
+    )
+    return model
 
 def main():
     base = "/home/samer/Desktop/competitions/Barbados_Traffic_Analysis_Challenge_dev"
     train_path = os.path.join(base, "demos/Train.csv")
-    test_path = os.path.join(base, "demos/TestInputSegments.csv")
     
-    print("Preparing Data...")
     X, y = create_sequential_dataset(train_path)
     split = int(len(X) * 0.8)
     X_train, X_val = X[:split], X[split:]
@@ -272,99 +269,38 @@ def main():
     
     train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(2048)
     val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(2048)
-
-    # Calculate class weights for the 16 joint labels
+    
     unique, counts = np.unique(y_train, return_counts=True)
     class_counts = dict(zip(unique, counts))
-    total_samples = len(y_train)
-    
-    cw_dict = {}
-    for i in range(16):
-        count = class_counts.get(i, 0)
-        if count > 0:
-            cw_dict[i] = total_samples / (16.0 * count)
-        else:
-            cw_dict[i] = 1.0
-            
-    # Normalize weights so they average to 1.0 (recommended for Keras)
+    cw_dict = {i: len(y_train) / (16.0 * class_counts.get(i, 1.0)) for i in range(16)}
     avg_w = sum(cw_dict.values()) / 16.0
     cw_dict = {k: v / avg_w for k, v in cw_dict.items()}
 
-    # Use L2 regularization to prevent weight explosion
-    reg = keras.regularizers.L2(0.0001)
-    model = FFNetwork(dims=[25, 512, 512, 512, 512], kernel_regularizer=reg) 
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.0003), 
-        jit_compile=False,
-        metrics=["acc", "f1"]
+    tuner = kt.Hyperband(
+        build_model,
+        objective=kt.Objective("val_f1", direction="max"),
+        max_epochs=20,
+        factor=3,
+        directory=os.path.join(base, "hyperband_search"),
+        project_name="ff_traffic",
+        seed=SEED
     )
-    
-    print("Training Model (5 epochs)...")
-    model.fit(
-        train_dataset, 
-        validation_data=val_dataset, 
-        epochs=5, 
-        verbose=1,
-        class_weight=cw_dict
+
+    tuner.search(
+        train_dataset,
+        validation_data=val_dataset,
+        class_weight=cw_dict,
+        callbacks=[keras.callbacks.EarlyStopping(patience=3)]
     )
-    
-    print("\nInference on TestInputSegments...")
-    test_df = pd.read_csv(test_path)
-    
-    congestion_map = {0: 'free flowing', 1: 'light delay', 2: 'moderate delay', 3: 'heavy delay'}
-    submission_rows = []
 
-    # Process each location independently
-    for label, group in test_df.groupby('view_label'):
-        group = group.sort_values('time_segment_id')
-        ids = group['time_segment_id'].values
-        
-        # Identify sequential chunks in test data
-        is_break = np.zeros(len(ids), dtype=int)
-        is_break[1:] = (ids[1:] != ids[:-1] + 1).astype(int)
-        group['block_id'] = np.cumsum(is_break)
-        
-        for b_id, block in group.groupby('block_id'):
-            feats, _ = get_features_and_labels(block)
-            last_feat = feats[-1]
-            
-            # Predict future steps
-            current_state = np.copy(last_feat)
-            start_id = int(round(last_feat[3] * 5000))
-            
-            # Pattern in SampleSubmission.csv shows a 2-segment gap (Start = Last + 3)
-            # Predict T+3, T+4, T+5, T+6, T+7
-            for i in range(1, 8): 
-                # Input to model must be padded (16 zeros)
-                input_vec = np.zeros(16 + len(current_state), dtype='float32')
-                input_vec[16:] = current_state
-                
-                p_joint = model.predict_one(ops.convert_to_tensor(input_vec)).numpy()
-                
-                # Split the joint label (0-15) back into Enter and Exit
-                p_enter_label = congestion_map[p_joint // 4]
-                
-                target_id = start_id + i
-                
-                # Predict T+3, T+4, T+5, T+6, T+7
-                if i >= 3:
-                    # Enter rating row
-                    enter_id = f"time_segment_{target_id}_{label}_congestion_enter_rating"
-                    submission_rows.append({
-                        'ID': enter_id, 
-                        'Target': p_enter_label, 
-                        'Target_Accuracy': p_enter_label
-                    })
-                
-                # Update state for next step prediction (Autoregressive)
-                current_state[0] += (1/1440.0)
-                current_state[3] += (1/5000.0)
-
-    submission_df = pd.DataFrame(submission_rows)
-    output_path = os.path.join(base, "submissions/submission.csv")
-    submission_df.to_csv(output_path, index=False)
-    print(f"\nSubmission file generated: {output_path}")
-    print(f"Total rows in submission: {len(submission_df)}")
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    print("\nBest Hyperparameters:")
+    print(f"Layers: {best_hps.get('num_layers')}")
+    print(f"Units: {best_hps.get('units')}")
+    print(f"Learning Rate: {best_hps.get('learning_rate')}")
+    print(f"Threshold: {best_hps.get('threshold')}")
+    print(f"Layer Epochs: {best_hps.get('layer_epochs')}")
+    print(f"L2 Reg: {best_hps.get('l2_reg')}")
 
 if __name__ == "__main__":
     main()
