@@ -1,0 +1,17 @@
+{
+  "id": "samerattrah/ff-hyperband-traffic",
+  "title": "FF Hyperband Traffic",
+  "code_file": "ff_hyperband_kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "samerattrah/barbados-traffic-analysis-challenge"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
