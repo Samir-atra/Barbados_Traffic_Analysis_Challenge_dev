@@ -1,4 +1,4 @@
-"""Module implementing the Forward-Forward algorithm for traffic prediction.
+"""Module implementing the Forward-Forward algorithm for traffic prediction (Kaggle Version).
 
 This script implements a Forward-Forward (FF) neural network to predict future
 traffic congestion states based on sequential historical data. It handles
@@ -24,7 +24,7 @@ import tensorflow as tf
 import keras
 from keras import ops
 import numpy as np
-import pandas as pd
+import polars as pl
 import matplotlib.pyplot as plt
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.compiler.tf2xla.python import xla
@@ -40,25 +40,31 @@ keras.utils.set_random_seed(SEED)
 # --- Data Preparation Helpers ---
 
 def get_features_and_labels(df):
-    """Extracts and encodes features and labels from a traffic dataframe.
+    """Extracts and encodes features and labels from a traffic dataframe (Polars).
     
     This function performs feature engineering on temporal, spatial, and 
     signaling data. It maps categorical congestion ratings to integers and 
     one-hot encodes view labels and signaling states.
 
     Args:
-        df: A pandas DataFrame containing raw traffic data.
+        df: A Polars DataFrame containing raw traffic data.
 
     Returns:
         A tuple (features, labels):
             - features: A float32 NumPy array of shape (N, 13).
             - labels: An int32 NumPy array of shape (N,) containing joint labels.
     """
-    df = df.copy()
-    df['video_time'] = pd.to_datetime(df['video_time'])
-    df['hour'] = df['video_time'].dt.hour / 23.0
-    df['minute'] = df['video_time'].dt.minute / 59.0
-    df['day_of_week'] = pd.to_datetime(df['date']).dt.dayofweek / 6.0
+    # Ensure date/time columns are proper types
+    df = df.with_columns([
+        pl.col("video_time").str.to_datetime(),
+        pl.col("date").str.to_datetime()
+    ])
+
+    df = df.with_columns([
+        (pl.col("video_time").dt.hour() / 23.0).alias("hour"),
+        (pl.col("video_time").dt.minute() / 59.0).alias("minute"),
+        ((pl.col("date").dt.weekday() - 1) / 6.0).alias("day_of_week") # Mon=1 -> 0
+    ])
     
     view_map = {
         'Norman Niles #1': 0, 
@@ -66,8 +72,11 @@ def get_features_and_labels(df):
         'Norman Niles #3': 2, 
         'Norman Niles #4': 3
     }
-    df['view_id'] = df['view_label'].map(view_map)
-    df['seg_id_norm'] = df['time_segment_id'] / 5000.0
+    # Use replace (map_dict deprecated/renamed)
+    df = df.with_columns(
+        pl.col("view_label").replace(view_map, default=0).cast(pl.Int32).alias("view_id"),
+        (pl.col("time_segment_id") / 5000.0).alias("seg_id_norm")
+    )
     
     congestion_map = {
         'free flowing': 0,
@@ -75,32 +84,43 @@ def get_features_and_labels(df):
         'moderate delay': 2,
         'heavy delay': 3
     }
-    df['enter_id'] = df['congestion_enter_rating'].map(congestion_map).fillna(0).astype(int)
+    df = df.with_columns(
+        pl.col("congestion_enter_rating").replace(congestion_map, default=0).cast(pl.Int32).alias("enter_id")
+    )
     
-    view_1hot = pd.get_dummies(df['view_id'], prefix='view').reindex(
-        columns=['view_0', 'view_1', 'view_2', 'view_3'], fill_value=0).astype(float).values
+    # One-hot encoding for view_id
+    # We manually construct it to ensure order and presence of all columns
+    # Polars to_dummies might skip unseen values
+    view_ids = df["view_id"].to_numpy()
+    view_1hot = np.zeros((len(view_ids), 4), dtype=float)
+    view_1hot[np.arange(len(view_ids)), view_ids] = 1.0
     
-    # signaling feature mapping
+    # Signaling feature mapping
     sig_map = {'none': 0, 'low': 1, 'medium': 2, 'high': 3}
-    df['sig_id'] = df['signaling'].map(sig_map).fillna(0)
-    sig_1hot = pd.get_dummies(df['sig_id'], prefix='sig').reindex(
-        columns=['sig_0', 'sig_1', 'sig_2', 'sig_3'], fill_value=0).astype(float).values
+    df = df.with_columns(
+         pl.col("signaling").replace(sig_map, default=0).cast(pl.Int32).alias("sig_id")
+    )
+    sig_ids = df["sig_id"].to_numpy()
+    sig_1hot = np.zeros((len(sig_ids), 4), dtype=float)
+    sig_1hot[np.arange(len(sig_ids)), sig_ids] = 1.0
+    
+    base_feats = df.select(["hour", "minute", "day_of_week", "seg_id_norm", "view_id"]).to_numpy()
     
     features = np.concatenate([
-        df[['hour', 'minute', 'day_of_week', 'seg_id_norm', 'view_id']].values,
+        base_feats,
         view_1hot,
         sig_1hot
     ], axis=1).astype('float32') # 5 base + 4 view-1hot + 4 sig-1hot = 13 features
     
-    return features, df['enter_id'].values
+    return features, df['enter_id'].to_numpy()
 
 def identify_blocks(group):
-    """Sorts by time_segment_id and identifies continuous sequential blocks."""
-    group = group.sort_values('time_segment_id')
-    ids = group['time_segment_id'].values
-    is_break = np.zeros(len(ids), dtype=int)
-    is_break[1:] = (ids[1:] != ids[:-1] + 1).astype(int)
-    group['block_id'] = np.cumsum(is_break)
+    """Sorts by time_segment_id and identifies continuous sequential blocks (Polars)."""
+    group = group.sort("time_segment_id")
+    # time_segment_id difference
+    diff = group["time_segment_id"].diff().fill_null(1)
+    is_break = (diff != 1).cast(pl.Int32)
+    group = group.with_columns(is_break.cum_sum().alias("block_id"))
     return group
 
 def create_dataset_splits(csv_path, val_split=0.2):
@@ -118,25 +138,41 @@ def create_dataset_splits(csv_path, val_split=0.2):
     Returns:
         A tuple (X_train, y_train, X_val, y_val).
     """
-    df = pd.read_csv(csv_path)
+    df = pl.read_csv(csv_path)
     train_X, train_y = [], []
     val_X, val_y = [], []
     seq_len = 15
     
-    print(f"Loading {len(df)} rows from {csv_path}...")
-    for label, group in df.groupby('view_label'):
+    print(f"Loading {len(df)} rows from {csv_path} with Polars...")
+    
+    # Partition by view_label
+    # Polars partition_by returns a list of DataFrames
+    partitions = df.partition_by("view_label")
+    
+    for group in partitions:
+        label = group["view_label"][0]
         print(f"  Processing view: {label}")
+        
         group = identify_blocks(group)
         view_X, view_y = [], []
         
-        for b_id, block in group.groupby('block_id'):
+        block_partitions = group.partition_by("block_id")
+        
+        for block in block_partitions:
             if len(block) < seq_len + 1: continue
             feats, labels = get_features_and_labels(block)
-            for i in range(len(feats) - seq_len):
-                # Concatenate 15 steps of features: [Xt-14, ..., Xt]
-                window = feats[i : i + seq_len].flatten()
-                view_X.append(window)
-                view_y.append(labels[i + seq_len])
+            
+            # Using strided windowing could be faster but looping is fine for this scale
+            # To optimize CPU further, we can vectorize this sliding window creation
+            n_samples = len(feats) - seq_len
+            if n_samples > 0:
+                # Vectorized sliding window
+                indexer = np.arange(seq_len)[None, :] + np.arange(n_samples)[:, None]
+                windows = feats[indexer].reshape(n_samples, -1)
+                targets = labels[seq_len:]
+                
+                view_X.extend(windows)
+                view_y.extend(targets)
         
         # Split this view's data
         n_total = len(view_X)
@@ -151,6 +187,7 @@ def create_dataset_splits(csv_path, val_split=0.2):
                 
     # Convert to arrays and pad with label buffer
     def pad_X(X_list):
+        if not X_list: return np.zeros((0, 15*13 + 4), dtype='float32') # approximate shape
         X_arr = np.array(X_list)
         X_padded = np.zeros((X_arr.shape[0], 4 + X_arr.shape[1]), dtype='float32')
         X_padded[:, 4:] = X_arr
@@ -561,14 +598,18 @@ def plot_training_results(history, output_dir):
 # --- Main ---
 
 def main():
-    """Main execution block for training and inference.
+    """Main execution block for training and inference (Kaggle Paths, Polars Optimized)."""
+    # Kaggle specific paths
+    train_path = "/kaggle/input/barbados-traffic-analysis-challenge/Train.csv"
+    test_path = "/kaggle/input/barbados-traffic-analysis-challenge/TestInputSegments.csv"
+    sample_sub_path = "/kaggle/input/barbados-traffic-analysis-challenge/SampleSubmission.csv"
     
-    Loads data, trains the FF network using balanced class sampling,
-    visualizes metrics, and generates the final submission file.
-    """
-    base = "/home/samer/Desktop/competitions/Barbados_Traffic_Analysis_Challenge_dev"
-    train_path = os.path.join(base, "demos/Train.csv")
-    test_path = os.path.join(base, "demos/TestInputSegments.csv")
+    # Output directories in Kaggle working directory
+    base_out = "/kaggle/working"
+    analytics_dir = os.path.join(base_out, "analytics")
+    submissions_dir = os.path.join(base_out, "submissions")
+    os.makedirs(analytics_dir, exist_ok=True)
+    os.makedirs(submissions_dir, exist_ok=True)
     
     print("Preparing Data...")
     X_train, y_train, X_val, y_val = create_dataset_splits(train_path)
@@ -607,7 +648,7 @@ def main():
     # dims[0] must match the feature length (original features + 4-dim one-hot label)
     input_dim = X_train.shape[1]
     model = FFNetwork(
-        dims=[input_dim, 256, 512, 256, 128], # UPDATED: 2 layers of 256 units
+        dims=[input_dim, 256, 512, 512, 512, 512, 256, 128], # UPDATED: 2 layers of 256 units
         kernel_regularizer=reg,
         learning_rate=lr_schedule,
         use_ema=True,
@@ -631,30 +672,36 @@ def main():
     )
     
     print("\nVisualizing Metrics...")
-    analytics_dir = os.path.join(base, "analytics")
     plot_training_results(history, analytics_dir)
     
     print("\nInference on TestInputSegments (8-step horizon)...")
     congestion_map = {0: 'free flowing', 1: 'light delay', 2: 'moderate delay', 3: 'heavy delay'}
-    test_df = pd.read_csv(test_path)
+    test_df = pl.read_csv(test_path)
     
     # Store predictions in a dictionary: (view_label, time_segment_id) -> prediction
     prediction_dict = {}
 
-    for label, group in test_df.groupby('view_label'):
+    partitions = test_df.partition_by("view_label")
+
+    for group in partitions:
         # Sort by time to ensure sequential continuity
         group = identify_blocks(group)
+        label = group["view_label"][0]
         
-        for b_id, block in group.groupby('block_id'):
+        block_partitions = group.partition_by("block_id")
+
+        for block in block_partitions:
             # Predict precisely 8 future steps starting from the end of each block
             feats, _ = get_features_and_labels(block)
             
             # Use the last 15 steps of history as the initial context
             if len(feats) < 15:
                 # Fallback: pad with duplicates if block is too short (rare)
-                history = [feats[0]] * (15 - len(feats)) + list(feats)
+                # feats is np array
+                pad_len = 15 - len(feats)
+                history = np.concatenate([np.tile(feats[0], (pad_len, 1)), feats], axis=0).tolist()
             else:
-                history = list(feats[-15:])
+                history = feats[-15:].tolist()
             
             # Seg ID is index 3 in the feature vector
             start_id = int(round(history[-1][3] * 5000))
@@ -675,7 +722,7 @@ def main():
                 prediction_dict[(label, target_id)] = p_label
                 
                 # Create next step's features to push into history
-                next_feat = np.copy(history[-1])
+                next_feat = np.array(history[-1])
                 
                 # Update time (assuming 5 minute intervals)
                 curr_h = next_feat[0] * 23.0
@@ -695,27 +742,50 @@ def main():
 
     # Map predictions to SampleSubmission IDs
     print("Mapping 8-step predictions to SampleSubmission template...")
-    sample_sub_path = os.path.join(base, "demos/SampleSubmission.csv")
-    sample_sub = pd.read_csv(sample_sub_path)
+    sample_sub = pl.read_csv(sample_sub_path)
     
-    final_targets = []
-    for idx, row in sample_sub.iterrows():
-        # Parse ID: time_segment_XXX_Label_congestion_enter_rating
-        parts = row['ID'].split('_')
-        tid = int(parts[2])
-        vlabel = parts[3]
-        
-        # Look up prediction in dictionary, fallback to 'free flowing'
-        pred = prediction_dict.get((vlabel, tid), 'free flowing')
-        final_targets.append(pred)
+    # Create a prediction dataframe
+    keys = list(prediction_dict.keys()) # List of tuples (label, tid)
+    values = list(prediction_dict.values())
+    
+    # Check if we have predictions
+    if keys:
+        pred_df = pl.DataFrame({
+            "view_label": [k[0] for k in keys],
+            "time_segment_id": [k[1] for k in keys],
+            "Predicted_Target": values
+        })
 
-    sample_sub['Target'] = final_targets
-    sample_sub['Target_Accuracy'] = final_targets
-    
-    output_path = os.path.join(base, "submissions/submission.csv")
-    sample_sub.to_csv(output_path, index=False)
+        # To join with SampleSubmission, we need to parse ID
+        # ID format: time_segment_XXX_Label_congestion_enter_rating
+        # We can extract tid and label from ID string in sample_sub
+        
+        sample_sub = sample_sub.with_columns(
+            pl.col("ID").str.split("_").list.get(2).cast(pl.Int32).alias("time_segment_id"),
+            pl.col("ID").str.split("_").list.get(3).alias("view_label")
+        )
+        
+        # Join
+        final_sub = sample_sub.join(pred_df, on=["view_label", "time_segment_id"], how="left")
+        
+        # Fill nulls with 'free flowing'
+        final_sub = final_sub.with_columns(
+            pl.col("Predicted_Target").fill_null("free flowing").alias("Target")
+        )
+        
+        final_sub = final_sub.with_columns(pl.col("Target").alias("Target_Accuracy"))
+        final_select = final_sub.select(["ID", "Target", "Target_Accuracy"])
+    else:
+        print("Warning: No predictions generated. Filling with default.")
+        final_select = sample_sub.with_columns([
+            pl.lit("free flowing").alias("Target"),
+            pl.lit("free flowing").alias("Target_Accuracy")
+        ]).select(["ID", "Target", "Target_Accuracy"])
+
+    output_path = os.path.join(submissions_dir, "submission.csv")
+    final_select.write_csv(output_path)
     print(f"\nSubmission file generated: {output_path}")
-    print(f"Total rows: {len(sample_sub)}")
+    print(f"Total rows: {len(final_select)}")
 
 if __name__ == "__main__":
     main()
