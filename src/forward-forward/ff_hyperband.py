@@ -84,13 +84,14 @@ def create_sequential_dataset(csv_path):
 # --- Forward-Forward Classes ---
 
 class FFDense(keras.layers.Layer):
-    def __init__(self, units, num_epochs=60, threshold=1.5, learning_rate=0.003, kernel_regularizer=None, **kwargs):
+    def __init__(self, units, num_epochs=60, threshold=1.5, learning_rate=0.003, kernel_regularizer=None, gamma=0.1, **kwargs):
         super().__init__(**kwargs)
         self.units = units
         self.num_epochs = num_epochs
         self.threshold = threshold
         self.learning_rate = learning_rate
         self.kernel_regularizer = kernel_regularizer
+        self.gamma = gamma
         self.dense = keras.layers.Dense(
             units=units, 
             kernel_regularizer=kernel_regularizer,
@@ -110,8 +111,8 @@ class FFDense(keras.layers.Layer):
                 g_pos = ops.mean(ops.power(self.call(x_pos), 2), 1)
                 g_neg = ops.mean(ops.power(self.call(x_neg), 2), 1)
                 
-                loss_pos = ops.log(1 + ops.exp(-g_pos + self.threshold))
-                loss_neg = ops.log(1 + ops.exp(g_neg - self.threshold))
+                loss_pos = ops.log(1 + ops.exp(-g_pos * self.gamma + self.threshold))
+                loss_neg = ops.log(1 + ops.exp(g_neg * self.gamma - self.threshold))
                 
                 if sample_weight is not None:
                     loss_pos = loss_pos * ops.cast(sample_weight, loss_pos.dtype)
@@ -126,12 +127,13 @@ class FFDense(keras.layers.Layer):
         return ops.stop_gradient(self.call(x_pos)), ops.stop_gradient(self.call(x_neg)), self.loss_metric.result()
 
 class FFNetwork(keras.Model):
-    def __init__(self, dims, layer_epochs=60, threshold=1.5, learning_rate=0.003, kernel_regularizer=None, **kwargs):
+    def __init__(self, dims, layer_epochs=60, threshold=1.5, learning_rate=0.003, kernel_regularizer=None, gamma=0.1, **kwargs):
         super().__init__(**kwargs)
+        self.gamma = gamma
         self.loss_var = keras.Variable(0.0, trainable=False)
         self.loss_count = keras.Variable(0.0, trainable=False)
         self.ff_layers = [
-            FFDense(d, num_epochs=layer_epochs, threshold=threshold, learning_rate=learning_rate, kernel_regularizer=kernel_regularizer) 
+            FFDense(d, num_epochs=layer_epochs, threshold=threshold, learning_rate=learning_rate, kernel_regularizer=kernel_regularizer, gamma=self.gamma) 
             for d in dims[1:]
         ]
         self.acc_tracker = keras.metrics.SparseCategoricalAccuracy(name="acc")
@@ -233,12 +235,13 @@ class FFNetwork(keras.Model):
 # --- Keras Tuner Integration ---
 
 def build_model(hp):
-    num_layers = hp.Int("num_layers", 1, 5)
-    units = hp.Choice("units", [256, 512, 768, 1024])
-    learning_rate = hp.Float("learning_rate", 1e-4, 1e-2, sampling="log")
+    num_layers = hp.Int("num_layers", 1, 10)
+    units = hp.Choice("units", [32, 64, 128, 256, 512])
+    learning_rate = hp.Float("learning_rate", 1e-5, 1e-2, sampling="log")
     threshold = hp.Float("threshold", 1.0, 3.0)
     layer_epochs = hp.Int("layer_epochs", 30, 100)
     l2_reg = hp.Float("l2_reg", 1e-5, 1e-2, sampling="log")
+    gamma = hp.Float("gamma", 0.1, 1.0, sampling="log")
     
     dims = [25] + [units] * num_layers
     reg = keras.regularizers.L2(l2_reg)
@@ -248,7 +251,8 @@ def build_model(hp):
         layer_epochs=layer_epochs,
         threshold=threshold,
         learning_rate=learning_rate,
-        kernel_regularizer=reg
+        kernel_regularizer=reg,
+        gamma=gamma,
     )
     
     model.compile(
@@ -267,8 +271,8 @@ def main():
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
     
-    train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(2048)
-    val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(2048)
+    train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(32)
+    val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(32)
     
     unique, counts = np.unique(y_train, return_counts=True)
     class_counts = dict(zip(unique, counts))
