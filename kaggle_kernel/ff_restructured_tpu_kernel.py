@@ -1,16 +1,14 @@
-"""Module implementing the Forward-Forward algorithm for traffic prediction (Kaggle Version).
+"""Module implementing the Forward-Forward algorithm for traffic prediction (Kaggle TPU Version).
 
-This script implements a Forward-Forward (FF) neural network to predict future
-traffic congestion states based on sequential historical data. It handles
-dataset imbalance using weighted sampling and includes visualization for
-model evaluation metrics.
+This script implements a Forward-Forward (FF) neural network optimized for TPU execution
+to predict future traffic congestion states based on sequential historical data.
 
 Workflow:
-1. Load and preprocess traffic data from Train.csv.
-2. Group data into sequential blocks for time-series prediction.
-3. Train a Forward-Forward network with Focal Loss and Layer Normalization.
-4. Address class imbalance through balanced class sampling.
-5. Predict the next 5 congestion states for TestInputSegments.csv.
+1. Initialize TPU and distribution strategy.
+2. Load and preprocess traffic data from Train.csv.
+3. Group data into sequential blocks for time-series prediction.
+4. Train a Forward-Forward network with Focal Loss using TPU acceleration.
+5. Predict the next 8 congestion states for TestInputSegments.csv.
 6. Generate a submission-ready CSV file.
 """
 
@@ -19,8 +17,6 @@ import matplotlib
 matplotlib.use('Agg')
 
 os.environ["KERAS_BACKEND"] = "tensorflow"
-# Restrict to a single GPU
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import tensorflow as tf
 import keras
@@ -40,24 +36,23 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 keras.utils.set_random_seed(SEED)
 
+# --- TPU Initialization ---
+print("Detecting TPU...")
+try:
+    resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
+    tf.config.experimental_connect_to_cluster(resolver)
+    tf.tpu.experimental.initialize_tpu_system(resolver)
+    strategy = tf.distribute.TPUStrategy(resolver)
+    print(f"TPU initialized: {resolver.cluster_spec().as_dict()}")
+    print(f"Number of replicas: {strategy.num_replicas_in_sync}")
+except ValueError:
+    print("TPU not found, falling back to default strategy")
+    strategy = tf.distribute.get_strategy()
+
 # --- Data Preparation Helpers ---
 
 def get_features_and_labels(df):
-    """Extracts and encodes features and labels from a traffic dataframe (Polars + JAX).
-    
-    This function performs feature engineering on temporal, spatial, and 
-    signaling data. It maps categorical congestion ratings to integers and 
-    one-hot encodes view labels and signaling states.
-
-    Args:
-        df: A Polars DataFrame containing raw traffic data.
-
-    Returns:
-        A tuple (features, labels):
-            - features: A float32 JAX array of shape (N, 13).
-            - labels: An int32 NumPy array of shape (N,) containing joint labels.
-    """
-    # Ensure date/time columns are proper types
+    """Extracts and encodes features and labels from a traffic dataframe (Polars + JAX)."""
     df = df.with_columns([
         pl.col("video_time").str.to_datetime(),
         pl.col("date").str.to_datetime()
@@ -66,7 +61,7 @@ def get_features_and_labels(df):
     df = df.with_columns([
         (pl.col("video_time").dt.hour() / 23.0).alias("hour"),
         (pl.col("video_time").dt.minute() / 59.0).alias("minute"),
-        ((pl.col("date").dt.weekday() - 1) / 6.0).alias("day_of_week") # Mon=1 -> 0
+        ((pl.col("date").dt.weekday() - 1) / 6.0).alias("day_of_week")
     ])
     
     view_map = {
@@ -75,29 +70,30 @@ def get_features_and_labels(df):
         'Norman Niles #3': 2, 
         'Norman Niles #4': 3
     }
-    # Use replace (map_dict deprecated/renamed)
     df = df.with_columns(
         pl.col("view_label").replace(view_map, default=0).cast(pl.Int32).alias("view_id"),
         (pl.col("time_segment_id") / 5000.0).alias("seg_id_norm")
     )
     
-    congestion_map = {
-        'free flowing': 0,
-        'light delay': 1,
-        'moderate delay': 2,
-        'heavy delay': 3
-    }
-    df = df.with_columns(
-        pl.col("congestion_enter_rating").replace(congestion_map, default=0).cast(pl.Int32).alias("enter_id")
-    )
+    if "congestion_enter_rating" in df.columns:
+        congestion_map = {
+            'free flowing': 0,
+            'light delay': 1,
+            'moderate delay': 2,
+            'heavy delay': 3
+        }
+        df = df.with_columns(
+            pl.col("congestion_enter_rating").replace(congestion_map, default=0).cast(pl.Int32).alias("enter_id")
+        )
+        labels = df['enter_id'].to_numpy()
+    else:
+        labels = np.zeros(len(df), dtype=np.int32)
     
-    # One-hot encoding for view_id
     view_ids = df["view_id"].to_numpy()
     view_ids_jax = jnp.array(view_ids)
     view_1hot = jnp.zeros((len(view_ids), 4), dtype=float)
     view_1hot = view_1hot.at[jnp.arange(len(view_ids)), view_ids_jax].set(1.0)
     
-    # Signaling feature mapping
     sig_map = {'none': 0, 'low': 1, 'medium': 2, 'high': 3}
     df = df.with_columns(
          pl.col("signaling").replace(sig_map, default=0).cast(pl.Int32).alias("sig_id")
@@ -113,34 +109,20 @@ def get_features_and_labels(df):
         base_feats,
         view_1hot,
         sig_1hot
-    ], axis=1).astype('float32') # 5 base + 4 view-1hot + 4 sig-1hot = 13 features
+    ], axis=1).astype('float32')
     
-    return features, df['enter_id'].to_numpy() # Keep labels as numpy for simple indexing/TF compat initially
+    return features, labels
 
 def identify_blocks(group):
     """Sorts by time_segment_id and identifies continuous sequential blocks (Polars)."""
     group = group.sort("time_segment_id")
-    # time_segment_id difference
     diff = group["time_segment_id"].diff().fill_null(1)
     is_break = (diff != 1).cast(pl.Int32)
     group = group.with_columns(is_break.cum_sum().alias("block_id"))
     return group
 
 def create_dataset_splits(csv_path, val_split=0.2):
-    """Processes CSV data into sequential training and validation samples.
-    
-    Groups traffic records by view_label and sequential time blocks. For each
-    block, it creates input/target pairs where input is the current state
-    and target is the congestion level at the next time step. Splits are done
-    per view to ensure all views are represented in both sets.
-
-    Args:
-        csv_path: Path to the Train.csv file.
-        val_split: Fraction of data to use for validation (default 0.2).
-
-    Returns:
-        A tuple (X_train, y_train, X_val, y_val).
-    """
+    """Processes CSV data into sequential training and validation samples."""
     df = pl.read_csv(csv_path)
     train_X, train_y = [], []
     val_X, val_y = [], []
@@ -148,7 +130,6 @@ def create_dataset_splits(csv_path, val_split=0.2):
     
     print(f"Loading {len(df)} rows from {csv_path} with Polars...")
     
-    # Partition by view_label
     partitions = df.partition_by("view_label")
     
     for group in partitions:
@@ -164,24 +145,15 @@ def create_dataset_splits(csv_path, val_split=0.2):
             if len(block) < seq_len + 1: continue
             feats, labels = get_features_and_labels(block)
             
-            # Use JAX arrays
             n_samples = len(feats) - seq_len
             if n_samples > 0:
-                # Vectorized sliding window with JAX
                 indexer = jnp.arange(seq_len)[None, :] + jnp.arange(n_samples)[:, None]
                 windows = feats[indexer].reshape(n_samples, -1)
                 targets = labels[seq_len:]
                 
-                # Convert to list for extension (avoiding massive JAX concat loop)
-                # Keras/TF handles list of JAX arrays or Numpy arrays fine
-                view_X.extend(np.array(windows)) # Convert back to numpy for list storage/memory? 
-                # Keeping as JAX might explode graph if not careful, better to store as collected dataset
-                # But request is "replace numpy functions with jax".
-                # Let's keep these as numpy for the list storage to avoid device OOM during loading
-                # then convert final to JAX/TF.
+                view_X.extend(np.array(windows)) 
                 view_y.extend(targets)
         
-        # Split this view's data
         n_total = len(view_X)
         if n_total > 0:
             n_val = int(n_total * val_split)
@@ -192,11 +164,9 @@ def create_dataset_splits(csv_path, val_split=0.2):
             val_X.extend(view_X[n_train:])
             val_y.extend(view_y[n_train:])
                 
-    # Convert to arrays and pad with label buffer
     def pad_X(X_list):
-        if not X_list: return jnp.zeros((0, 15*13 + 4), dtype='float32') # approximate shape
+        if not X_list: return jnp.zeros((0, 15*13 + 4), dtype='float32')
         X_arr = jnp.array(X_list)
-        # Pad with 4 zeros at the start (features at index 4 onwards)
         X_padded = jnp.zeros((X_arr.shape[0], 4 + X_arr.shape[1]), dtype='float32')
         X_padded = X_padded.at[:, 4:].set(X_arr)
         return X_padded
@@ -207,17 +177,11 @@ def create_dataset_splits(csv_path, val_split=0.2):
 
 @keras.saving.register_keras_serializable(package="MyLayers")
 class FFDense(keras.layers.Layer):
-    """A single Forward-Forward Dense layer with local learning.
-    
-    This layer implements the core FF logic: it trains itself using local 
-    goodness scores without global backpropagation. It includes LayerNorm 
-    and LeakyReLU for stability and employs Focal Loss to handle hard examples.
-    """
+    """A single Forward-Forward Dense layer with local learning."""
 
     def __init__(self, units, num_epochs=54, kernel_regularizer=None, gamma=1.0337, 
                  threshold=1.143, learning_rate=0.001, use_ema=True, ema_overwrite_frequency=1, 
                  activation='leaky_relu', **kwargs):
-        """Initializes the FFDense layer."""
         super().__init__(**kwargs)
         self.units = units
         self.num_epochs = num_epochs
@@ -239,7 +203,6 @@ class FFDense(keras.layers.Layer):
         else:
             self.activation = keras.layers.Activation(activation)
             
-        # Apply EMA and Clipping directly to the layer-wise optimizer
         self.optimizer = keras.optimizers.Adam(
             learning_rate=learning_rate, 
             global_clipnorm=1.0, 
@@ -264,47 +227,20 @@ class FFDense(keras.layers.Layer):
         return config
 
     def call(self, x):
-        """Forward pass of the layer with unit-norm normalization.
-
-        Args:
-            x: Input tensor.
-
-        Returns:
-            Normalized and activated layer output.
-        """
         x_norm = ops.norm(x, ord=2, axis=1, keepdims=True) + 1e-4
         h = self.dense(x / x_norm)
         return self.activation(h)
 
     def forward_forward(self, x_pos, x_neg, weights=None):
-        """Local training logic using the Forward-Forward algorithm.
-
-        Updates layer weights to maximize 'goodness' for positive (real) 
-        samples and minimize it for negative (perturbed) samples.
-
-        Args:
-            x_pos: Real samples with correct labels overlaid.
-            x_neg: Perturbed samples with incorrect labels overlaid.
-
-        Returns:
-            A tuple (h_pos, h_neg, loss):
-                - h_pos: Layer activations for positive samples.
-                - h_neg: Layer activations for negative samples.
-                - loss: Mean focal loss for this layer.
-        """
         for i in range(self.num_epochs):
             with tf.GradientTape() as tape:
                 g_pos = ops.mean(ops.power(self.call(x_pos), 2), 1)
                 g_neg = ops.mean(ops.power(self.call(x_neg), 2), 1)
                 
-                # Standard log-likelihood terms (Binary Cross-Entropy)
                 log_pos = ops.log(1 + ops.exp(-g_pos + self.threshold))
                 log_neg = ops.log(1 + ops.exp(g_neg - self.threshold))
                 
-                # Focal Loss weighting: (1 - p)^gamma
-                # p_pos = sigmoid(g_pos - threshold) -> 1 - p_pos = sigmoid(threshold - g_pos)
                 pt_pos = ops.sigmoid(-g_pos + self.threshold)
-                # p_neg = sigmoid(g_neg - threshold) -> targeting 0, so weight is p_neg^gamma
                 pt_neg = ops.sigmoid(g_neg - self.threshold)
                 
                 loss_pos = ops.power(pt_pos, self.gamma) * log_pos
@@ -316,7 +252,6 @@ class FFDense(keras.layers.Layer):
                 
                 loss = ops.concatenate([loss_pos, loss_neg], 0)
                 mean_loss = ops.cast(ops.mean(loss), dtype="float32")
-                # Add regularization losses
                 if self.dense.losses:
                     mean_loss += ops.sum(self.dense.losses)
                 self.loss_metric.update_state([mean_loss])
@@ -326,7 +261,6 @@ class FFDense(keras.layers.Layer):
 
 @keras.saving.register_keras_serializable(package="MyMetrics")
 class MacroPrecision(keras.metrics.Metric):
-    """Computes Macro-Averaged Precision for multi-class classification."""
     def __init__(self, num_classes=4, name="macro_precision", **kwargs):
         super().__init__(name=name, **kwargs)
         self.num_classes = num_classes
@@ -341,17 +275,12 @@ class MacroPrecision(keras.metrics.Metric):
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_true = ops.cast(y_true, "float32")
         y_pred = ops.cast(y_pred, "float32")
-        
-        # Calculate per-class True Positives and False Positives
         tp = ops.sum(y_true * y_pred, axis=0)
         fp = ops.sum((1 - y_true) * y_pred, axis=0)
-        
         self.tp.assign_add(tp)
         self.fp.assign_add(fp)
 
     def result(self):
-        # Precision = TP / (TP + FP)
-        # Add epsilon to avoid division by zero
         precisions = self.tp / (self.tp + self.fp + 1e-7)
         return ops.mean(precisions)
 
@@ -359,10 +288,8 @@ class MacroPrecision(keras.metrics.Metric):
         self.tp.assign(ops.zeros_like(self.tp))
         self.fp.assign(ops.zeros_like(self.fp))
 
-
 @keras.saving.register_keras_serializable(package="MyMetrics")
 class MacroRecall(keras.metrics.Metric):
-    """Computes Macro-Averaged Recall for multi-class classification."""
     def __init__(self, num_classes=4, name="macro_recall", **kwargs):
         super().__init__(name=name, **kwargs)
         self.num_classes = num_classes
@@ -377,16 +304,12 @@ class MacroRecall(keras.metrics.Metric):
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_true = ops.cast(y_true, "float32")
         y_pred = ops.cast(y_pred, "float32")
-        
-        # Calculate per-class True Positives and False Negatives
         tp = ops.sum(y_true * y_pred, axis=0)
         fn = ops.sum(y_true * (1 - y_pred), axis=0)
-        
         self.tp.assign_add(tp)
         self.fn.assign_add(fn)
 
     def result(self):
-        # Recall = TP / (TP + FN)
         recalls = self.tp / (self.tp + self.fn + 1e-7)
         return ops.mean(recalls)
 
@@ -396,16 +319,11 @@ class MacroRecall(keras.metrics.Metric):
 
 @keras.saving.register_keras_serializable(package="MyModels")
 class FFNetwork(keras.Model):
-    """The full Forward-Forward network model.
-
-    Coordinates layer-wise training, prediction via goodness summation, 
-    and custom training/test steps for Keras compatibility.
-    """
+    """The full Forward-Forward network model."""
 
     def __init__(self, dims, kernel_regularizer=None, learning_rate=0.001, 
                  use_ema=True, ema_overwrite_frequency=None, 
                  layer_epochs=54, threshold=1.143, gamma=1.0337, **kwargs):
-        """Initializes the network."""
         super().__init__(**kwargs)
         self.dims = dims
         self.kernel_regularizer = keras.regularizers.get(kernel_regularizer)
@@ -420,7 +338,6 @@ class FFNetwork(keras.Model):
         self.loss_count = keras.Variable(0.0, trainable=False)
         self.ff_layers = []
         for i, d in enumerate(dims[1:]):
-            # Use softmax for the last layer, LeakyReLU for others
             act = 'softmax' if i == len(dims[1:]) - 1 else 'leaky_relu'
             self.ff_layers.append(
                 FFDense(d, kernel_regularizer=self.kernel_regularizer, 
@@ -433,7 +350,6 @@ class FFNetwork(keras.Model):
         self.f1_tracker = keras.metrics.F1Score(name="f1", average="macro")
         self.precision_tracker = MacroPrecision(name="precision")
         self.recall_tracker = MacroRecall(name="recall")
-        # Explicitly build the model to allow weight saving
         self.build((None, dims[0]))
 
     def get_config(self):
@@ -452,47 +368,28 @@ class FFNetwork(keras.Model):
 
     @property
     def metrics(self):
-        """Returns the model's metrics for tracking."""
         return [self.acc_tracker, self.f1_tracker, self.precision_tracker, self.recall_tracker]
 
     def call(self, x):
-        """Standard forward pass through all layers for Keras tracing."""
         h = x
         for layer in self.ff_layers:
             h = layer(h)
         return h
 
     def overlay_y_on_x(self, data):
-        """Overlays the label 'y' onto the first 4 dimensions of input 'x'.
-        
-        Args:
-            data: Tuple of (x, y).
-
-        Returns:
-            Input vector with one-hot label encoded in the header.
-        """
         x, y = data
         y = ops.cast(y, "int32")
-        # Ensure y is scalar for one_hot, resulting shape (4,)
         y_scalar = ops.reshape(y, [])
-        
-        # Create header: 10.0 at class index, 0.0 elsewhere
         header = ops.one_hot(y_scalar, 4) * ops.cast(10.0, x.dtype)
-        
-        # Replace first 4 elements of x (which are 0-padded) with header
-        # x is 1D tensor here
         x_rest = x[4:]
         x_new = ops.concatenate([header, x_rest], axis=0)
-        
         return x_new, y
 
     @tf.function
     def predict_batch(self, x):
-        """Predicts labels for a batch of inputs using vectorized_map."""
         return ops.vectorized_map(self.predict_one, x)
 
     def train_step(self, data):
-        """Custom training step implementing layer-wise FF updates."""
         if len(data) == 3:
             x, y, weights = data
             weights = ops.cast(weights, "float32")
@@ -502,9 +399,7 @@ class FFNetwork(keras.Model):
 
         x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
         
-        # Generate negative labels that are strictly different from true labels
         batch_size = tf.shape(y)[0]
-        # Offsets of 1, 2, or 3 ensure y_neg != y (mod 4)
         offsets = tf.random.uniform(shape=[batch_size], minval=1, maxval=4, dtype=tf.int32)
         y_neg_labels = (tf.cast(y, tf.int32) + offsets) % 4
         x_neg, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y_neg_labels))
@@ -518,10 +413,8 @@ class FFNetwork(keras.Model):
             self.loss_var.assign_add(loss)
             self.loss_count.assign_add(1.0)
         
-        # Update training metrics
         y_pred = self.predict_batch(x)
         y_pred_1hot = ops.one_hot(y_pred, 4)
-        # Squeeze y to match (batch,) for targets if needed, or update_state handles (batch, 1)
         self.acc_tracker.update_state(y, y_pred_1hot)
         self.f1_tracker.update_state(ops.one_hot(y, 4), y_pred_1hot)
         self.precision_tracker.update_state(ops.one_hot(y, 4), y_pred_1hot)
@@ -536,7 +429,6 @@ class FFNetwork(keras.Model):
         }
 
     def test_step(self, data):
-        """Custom test step for validation set evaluation."""
         if len(data) == 3:
             x, y, weights = data
             weights = ops.cast(weights, "float32")
@@ -544,10 +436,8 @@ class FFNetwork(keras.Model):
             x, y = data
             weights = None
         
-        # Calculate goodness-based loss for validation (layer-wise average)
         x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
         
-        # Deterministic negative labels for validation (strictly different)
         batch_size = tf.shape(y)[0]
         offsets = tf.random.stateless_uniform(shape=[batch_size], seed=[SEED, SEED], minval=1, maxval=4, dtype=tf.int32)
         y_neg_labels = (tf.cast(y, tf.int32) + offsets) % 4
@@ -559,7 +449,6 @@ class FFNetwork(keras.Model):
             g_pos = ops.mean(ops.power(layer(h_pos), 2), 1)
             g_neg = ops.mean(ops.power(layer(h_neg), 2), 1)
             
-            # Focal Loss terms for validation
             log_pos = ops.log(1 + ops.exp(-g_pos + layer.threshold))
             log_neg = ops.log(1 + ops.exp(g_neg - layer.threshold))
             pt_pos = ops.sigmoid(-g_pos + layer.threshold)
@@ -574,7 +463,6 @@ class FFNetwork(keras.Model):
                 
             layer_loss_mean = ops.mean(ops.concatenate([layer_loss, layer_loss_neg], 0))
             v_loss += ops.cast(layer_loss_mean, "float32")
-            # Next layer inputs
             h_pos = ops.stop_gradient(layer(h_pos))
             h_neg = ops.stop_gradient(layer(h_neg))
         
@@ -595,18 +483,6 @@ class FFNetwork(keras.Model):
         }
 
     def predict_one(self, x):
-        """Predicts the label for a single sample by comparing goodness scores.
-
-        For each possible label (0-3), it calculates the sum of goodness 
-        (mean squared activation) across all layers. The label with the highest
-        total goodness is selected.
-
-        Args:
-            x: Raw input vector (padded with 4 zeros).
-
-        Returns:
-            Predicted enter rating index.
-        """
         h_all = []
         for label in range(4):
             h, _ = self.overlay_y_on_x((x, label))
@@ -623,12 +499,7 @@ class FFNetwork(keras.Model):
         return ops.cast(ops.argmax(total_goodness), "int32")
 
 def plot_training_results(history, output_dir):
-    """Generates and saves performance plots for all tracked metrics.
-
-    Args:
-        history: Keras history object returned by model.fit().
-        output_dir: Path to directory where PNG files will be saved.
-    """
+    """Generates and saves performance plots for all tracked metrics."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         
@@ -656,13 +527,11 @@ def plot_training_results(history, output_dir):
 # --- Main ---
 
 def main():
-    """Main execution block for training and inference (Kaggle Paths, Polars Optimized)."""
-    # Kaggle specific paths
+    """Main execution block for TPU training."""
     train_path = "/kaggle/input/barbados-traffic-analysis-challenge/Train.csv"
     test_path = "/kaggle/input/barbados-traffic-analysis-challenge/TestInputSegments.csv"
     sample_sub_path = "/kaggle/input/barbados-traffic-analysis-challenge/SampleSubmission.csv"
     
-    # Output directories in Kaggle working directory
     base_out = "/kaggle/working"
     analytics_dir = os.path.join(base_out, "analytics")
     submissions_dir = os.path.join(base_out, "submissions")
@@ -672,7 +541,7 @@ def main():
     print("Preparing Data...")
     X_train, y_train, X_val, y_val = create_dataset_splits(train_path)
     
-    # Direct sequential dataset without shuffling or balancing
+    # Create datasets
     train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
     train_dataset = train_dataset.shuffle(10000).batch(64).prefetch(tf.data.AUTOTUNE)
     
@@ -686,43 +555,39 @@ def main():
     )
     class_weight_dict = dict(zip(classes, weights))
 
-    # Use L2 regularization to prevent weight explosion
-    # Define training hyperparameters for the schedule
     global_epochs = 30
     batch_size = 64
-    local_layer_epochs = 60 # UPDATED: From Hyperband
+    local_layer_epochs = 60
     total_batches = len(X_train) // batch_size
     total_train_steps = global_epochs * total_batches * local_layer_epochs
     
-    # Cosine Decay Schedule
     lr_schedule = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=0.0090513, # UPDATED: From Hyperband
+        initial_learning_rate=0.0090513,
         decay_steps=total_train_steps,
         alpha=0.1
     )
 
-    # Use L2 regularization to prevent weight explosion
-    reg = keras.regularizers.L2(0.00079024) # UPDATED: From Hyperband
-    # dims[0] must match the feature length (original features + 4-dim one-hot label)
+    reg = keras.regularizers.L2(0.00079024)
     input_dim = X_train.shape[1]
     
-    # Architecture from Hyperband: 10 layers of 64 units
-    model = FFNetwork(
-        dims=[input_dim] + [64] * 10,
-        kernel_regularizer=reg,
-        learning_rate=lr_schedule,
-        use_ema=True,
-        ema_overwrite_frequency=1, # UPDATED: From Hyperband
-        layer_epochs=local_layer_epochs, 
-        threshold=3.6, # UPDATED: From Hyperband
-        gamma=1.3 # UPDATED: From Hyperband
-    ) 
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr_schedule, global_clipnorm=1.0), 
-        jit_compile=True  # Enable XLA compilation for faster execution
-    )
+    # Create model within TPU strategy scope
+    with strategy.scope():
+        model = FFNetwork(
+            dims=[input_dim] + [64] * 10,
+            kernel_regularizer=reg,
+            learning_rate=lr_schedule,
+            use_ema=True,
+            ema_overwrite_frequency=1,
+            layer_epochs=local_layer_epochs, 
+            threshold=3.6,
+            gamma=1.3
+        ) 
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=lr_schedule, global_clipnorm=1.0), 
+            jit_compile=True
+        )
     
-    print(f"Training Model ({global_epochs} epochs with Cosine Decay)...")
+    print(f"Training Model on TPU ({global_epochs} epochs with Cosine Decay)...")
     history = model.fit(
         train_dataset, 
         validation_data=val_dataset, 
@@ -731,7 +596,6 @@ def main():
         verbose=2
     )
     
-    # Save the full model (architecture + weights)
     model_path = os.path.join(base_out, "ff_model.keras")
     model.save(model_path)
     print(f"Model saved to {model_path}")
@@ -743,81 +607,56 @@ def main():
     congestion_map = {0: 'free flowing', 1: 'light delay', 2: 'moderate delay', 3: 'heavy delay'}
     test_df = pl.read_csv(test_path)
     
-    # Store predictions in a dictionary: (view_label, time_segment_id) -> prediction
     prediction_dict = {}
-
     partitions = test_df.partition_by("view_label")
 
     for group in partitions:
-        # Sort by time to ensure sequential continuity
         group = identify_blocks(group)
         label = group["view_label"][0]
-        
         block_partitions = group.partition_by("block_id")
 
         for block in block_partitions:
-            # Predict precisely 8 future steps starting from the end of each block
             feats, _ = get_features_and_labels(block)
             
-            # Use the last 15 steps of history as the initial context
-            # feats is a JAX array now
             if len(feats) < 15:
-                # Fallback: pad with duplicates if block is too short (rare)
                 pad_len = 15 - len(feats)
-                # JAX tile/concat
                 padded_feats = jnp.concatenate([jnp.tile(feats[0], (pad_len, 1)), feats], axis=0)
-                history = np.array(padded_feats).tolist() # Convert to list for easy appending (JAX append is inefficient)
+                history = np.array(padded_feats).tolist()
             else:
                 history = np.array(feats[-15:]).tolist()
             
-            # Seg ID is index 3 in the feature vector
             start_id = int(round(history[-1][3] * 5000))
             
             for i in range(1, 9):
-                # Current state is the flattened last 15 steps
-                # Convert list history back to JAX for prediction
                 current_window = jnp.array(history[-15:]).flatten()
-                
-                # Overlay label 0-3 requires 4 zeros buffer
                 input_vec = jnp.zeros(4 + len(current_window), dtype='float32')
                 input_vec = input_vec.at[4:].set(current_window)
                 
-                # Predict enter congestion state
                 p_label_idx = model.predict_one(ops.convert_to_tensor(input_vec)).numpy()
                 p_label = congestion_map[p_label_idx]
                 
                 target_id = start_id + i
                 prediction_dict[(label, target_id)] = p_label
                 
-                # Create next step's features to push into history
                 next_feat = jnp.array(history[-1])
-                
-                # Update time (assuming 5 minute intervals)
                 curr_h = next_feat[0] * 23.0
                 curr_m = next_feat[1] * 59.0
-                
                 curr_m += 5
                 if curr_m > 59:
                     curr_m -= 60
                     curr_h = (curr_h + 1) % 24
                 
-                # Functional updates for JAX
                 next_feat = next_feat.at[0].set(curr_h / 23.0)
                 next_feat = next_feat.at[1].set(curr_m / 59.0)
-                next_feat = next_feat.at[3].set(next_feat[3] + (1/5000.0)) # Increment segment ID
-                # (Note: signaling is assumed constant during forecasting)
-                
+                next_feat = next_feat.at[3].set(next_feat[3] + (1/5000.0))
                 history.append(np.array(next_feat).tolist())
 
-    # Map predictions to SampleSubmission IDs
     print("Mapping 8-step predictions to SampleSubmission template...")
     sample_sub = pl.read_csv(sample_sub_path)
     
-    # Create a prediction dataframe
-    keys = list(prediction_dict.keys()) # List of tuples (label, tid)
+    keys = list(prediction_dict.keys())
     values = list(prediction_dict.values())
     
-    # Check if we have predictions
     if keys:
         pred_df = pl.DataFrame({
             "view_label": [k[0] for k in keys],
@@ -825,23 +664,15 @@ def main():
             "Predicted_Target": values
         })
 
-        # To join with SampleSubmission, we need to parse ID
-        # ID format: time_segment_XXX_Label_congestion_enter_rating
-        # We can extract tid and label from ID string in sample_sub
-        
         sample_sub = sample_sub.with_columns(
             pl.col("ID").str.split("_").list.get(2).cast(pl.Int32).alias("time_segment_id"),
             pl.col("ID").str.split("_").list.get(3).alias("view_label")
         )
         
-        # Join
         final_sub = sample_sub.join(pred_df, on=["view_label", "time_segment_id"], how="left")
-        
-        # Fill nulls with 'free flowing'
         final_sub = final_sub.with_columns(
             pl.col("Predicted_Target").fill_null("free flowing").alias("Target")
         )
-        
         final_sub = final_sub.with_columns(pl.col("Target").alias("Target_Accuracy"))
         final_select = final_sub.select(["ID", "Target", "Target_Accuracy"])
     else:

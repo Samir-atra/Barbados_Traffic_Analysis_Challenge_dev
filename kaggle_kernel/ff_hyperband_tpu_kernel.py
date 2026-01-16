@@ -1,7 +1,7 @@
-"""Module implementing the Forward-Forward algorithm with Hyperband Tuning (Kaggle Version).
+"""Module implementing the Forward-Forward algorithm with Hyperband Tuning (Kaggle TPU Version).
 
 This script adapts the Forward-Forward (FF) neural network to use Keras Tuner's
-Hyperband algorithm for hyperparameter optimization, specifically targeting
+Hyperband algorithm for hyperparameter optimization on TPU, specifically targeting
 network depth and width.
 """
 
@@ -9,35 +9,46 @@ import os
 import matplotlib
 matplotlib.use('Agg')
 
-os.environ["KERAS_BACKEND"] = "tensorflow"
-# Restrict to a single GPU (T4)
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Configure JAX backend for TPU
+os.environ["KERAS_BACKEND"] = "jax"
 
-import tensorflow as tf
+import jax
+import jax.numpy as jnp
+from jax import random
 import keras
 from keras import ops
 import keras_tuner as kt
 import numpy as np
 import polars as pl
-import jax
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.compiler.tf2xla.python import xla
-import random
 import shutil
 
 # Set seeds for reproducibility
 SEED = 42
-random.seed(SEED)
 np.random.seed(SEED)
-tf.random.set_seed(SEED)
 keras.utils.set_random_seed(SEED)
+
+# Initialize TPU
+print("Initializing TPU...")
+try:
+    tpu = jax.devices('tpu')[0]
+    print(f"TPU devices found: {jax.devices()}")
+    print(f"TPU device count: {jax.device_count()}")
+except:
+    print("No TPU found, using CPU/GPU")
 
 # --- Data Preparation Helpers ---
 
 def get_features_and_labels(df):
-    """Extracts and encodes features and labels from a traffic dataframe (Polars + JAX)."""
+    """Extracts and encodes features and labels from a traffic dataframe (Polars + JAX).
+    
+    Args:
+        df: Polars DataFrame containing traffic data.
+        
+    Returns:
+        Tuple of (features, labels) as JAX arrays.
+    """
     # Ensure date/time columns are proper types
     df = df.with_columns([
         pl.col("video_time").str.to_datetime(),
@@ -47,7 +58,7 @@ def get_features_and_labels(df):
     df = df.with_columns([
         (pl.col("video_time").dt.hour() / 23.0).alias("hour"),
         (pl.col("video_time").dt.minute() / 59.0).alias("minute"),
-        ((pl.col("date").dt.weekday() - 1) / 6.0).alias("day_of_week") # Mon=1 -> 0
+        ((pl.col("date").dt.weekday() - 1) / 6.0).alias("day_of_week")  # Mon=1 -> 0
     ])
     
     view_map = {
@@ -98,7 +109,14 @@ def get_features_and_labels(df):
     return features, df['enter_id'].to_numpy()
 
 def identify_blocks(group):
-    """Sorts by time_segment_id and identifies continuous sequential blocks (Polars)."""
+    """Sorts by time_segment_id and identifies continuous sequential blocks (Polars).
+    
+    Args:
+        group: Polars DataFrame group.
+        
+    Returns:
+        Polars DataFrame with block_id column added.
+    """
     group = group.sort("time_segment_id")
     diff = group["time_segment_id"].diff().fill_null(1)
     is_break = (diff != 1).cast(pl.Int32)
@@ -106,7 +124,15 @@ def identify_blocks(group):
     return group
 
 def create_dataset_splits(csv_path, val_split=0.2):
-    """Processes CSV data into sequential training and validation samples."""
+    """Processes CSV data into sequential training and validation samples.
+    
+    Args:
+        csv_path: Path to the CSV file.
+        val_split: Validation split ratio.
+        
+    Returns:
+        Tuple of (X_train, y_train, X_val, y_val) as JAX/NumPy arrays.
+    """
     df = pl.read_csv(csv_path)
     train_X, train_y = [], []
     val_X, val_y = [], []
@@ -118,7 +144,6 @@ def create_dataset_splits(csv_path, val_split=0.2):
     
     for group in partitions:
         label = group["view_label"][0]
-        # print(f"  Processing view: {label}")
         
         group = identify_blocks(group)
         view_X, view_y = [], []
@@ -126,7 +151,8 @@ def create_dataset_splits(csv_path, val_split=0.2):
         block_partitions = group.partition_by("block_id")
         
         for block in block_partitions:
-            if len(block) < seq_len + 1: continue
+            if len(block) < seq_len + 1:
+                continue
             feats, labels = get_features_and_labels(block)
             
             n_samples = len(feats) - seq_len
@@ -149,7 +175,16 @@ def create_dataset_splits(csv_path, val_split=0.2):
             val_y.extend(view_y[n_train:])
                 
     def pad_X(X_list):
-        if not X_list: return jnp.zeros((0, 15*13 + 4), dtype='float32')
+        """Pads feature arrays with label slots.
+        
+        Args:
+            X_list: List of feature arrays.
+            
+        Returns:
+            Padded JAX array.
+        """
+        if not X_list:
+            return jnp.zeros((0, 15*13 + 4), dtype='float32')
         X_arr = jnp.array(X_list)
         X_padded = jnp.zeros((X_arr.shape[0], 4 + X_arr.shape[1]), dtype='float32')
         X_padded = X_padded.at[:, 4:].set(X_arr)
@@ -165,6 +200,20 @@ class FFDense(keras.layers.Layer):
     def __init__(self, units, num_epochs=54, kernel_regularizer=None, gamma=1.0337, 
                  threshold=1.143, learning_rate=0.001, use_ema=True, ema_overwrite_frequency=None, 
                  activation='leaky_relu', **kwargs):
+        """Initializes FFDense layer.
+        
+        Args:
+            units: Number of units in the layer.
+            num_epochs: Number of local training epochs.
+            kernel_regularizer: Kernel regularizer.
+            gamma: Focal loss gamma parameter.
+            threshold: Goodness threshold.
+            learning_rate: Learning rate.
+            use_ema: Whether to use exponential moving average.
+            ema_overwrite_frequency: EMA overwrite frequency.
+            activation: Activation function name.
+            **kwargs: Additional layer arguments.
+        """
         super().__init__(**kwargs)
         self.units = units
         self.dense = keras.layers.Dense(
@@ -189,45 +238,95 @@ class FFDense(keras.layers.Layer):
         self.gamma = gamma
 
     def call(self, x):
+        """Forward pass through the layer.
+        
+        Args:
+            x: Input tensor.
+            
+        Returns:
+            Activated output tensor.
+        """
         x_norm = ops.norm(x, ord=2, axis=1, keepdims=True) + 1e-4
         h = self.dense(x / x_norm)
         return self.activation(h)
 
     def forward_forward(self, x_pos, x_neg, weights=None):
+        """Performs forward-forward training on positive and negative samples.
+        
+        Args:
+            x_pos: Positive samples.
+            x_neg: Negative samples.
+            weights: Optional sample weights.
+            
+        Returns:
+            Tuple of (positive activations, negative activations, loss).
+        """
         for i in range(self.num_epochs):
-            with tf.GradientTape() as tape:
-                g_pos = ops.mean(ops.power(self.call(x_pos), 2), 1)
-                g_neg = ops.mean(ops.power(self.call(x_neg), 2), 1)
-                
-                log_pos = ops.log(1 + ops.exp(-g_pos + self.threshold))
-                log_neg = ops.log(1 + ops.exp(g_neg - self.threshold))
-                
-                pt_pos = ops.sigmoid(-g_pos + self.threshold)
-                pt_neg = ops.sigmoid(g_neg - self.threshold)
-                
-                loss_pos = ops.power(pt_pos, self.gamma) * log_pos
-                loss_neg = ops.power(pt_neg, self.gamma) * log_neg
-                
-                if weights is not None:
-                    loss_pos = loss_pos * weights
-                    loss_neg = loss_neg * weights
-                
-                loss = ops.concatenate([loss_pos, loss_neg], 0)
-                mean_loss = ops.cast(ops.mean(loss), dtype="float32")
-                if self.dense.losses:
-                    mean_loss += ops.sum(self.dense.losses)
-                self.loss_metric.update_state([mean_loss])
-            grads = tape.gradient(mean_loss, self.dense.trainable_weights)
-            self.optimizer.apply_gradients(zip(grads, self.dense.trainable_weights))
+            with jax.value_and_grad(lambda params: self._compute_loss(params, x_pos, x_neg, weights)) as (loss, grads):
+                # Apply gradients
+                self.optimizer.apply_gradients(zip(grads, self.dense.trainable_weights))
+                self.loss_metric.update_state([loss])
+        
         return ops.stop_gradient(self.call(x_pos)), ops.stop_gradient(self.call(x_neg)), self.loss_metric.result()
+    
+    def _compute_loss(self, params, x_pos, x_neg, weights):
+        """Computes the forward-forward loss.
+        
+        Args:
+            params: Model parameters.
+            x_pos: Positive samples.
+            x_neg: Negative samples.
+            weights: Optional sample weights.
+            
+        Returns:
+            Scalar loss value.
+        """
+        g_pos = ops.mean(ops.power(self.call(x_pos), 2), 1)
+        g_neg = ops.mean(ops.power(self.call(x_neg), 2), 1)
+        
+        log_pos = ops.log(1 + ops.exp(-g_pos + self.threshold))
+        log_neg = ops.log(1 + ops.exp(g_neg - self.threshold))
+        
+        pt_pos = ops.sigmoid(-g_pos + self.threshold)
+        pt_neg = ops.sigmoid(g_neg - self.threshold)
+        
+        loss_pos = ops.power(pt_pos, self.gamma) * log_pos
+        loss_neg = ops.power(pt_neg, self.gamma) * log_neg
+        
+        if weights is not None:
+            loss_pos = loss_pos * weights
+            loss_neg = loss_neg * weights
+        
+        loss = ops.concatenate([loss_pos, loss_neg], 0)
+        mean_loss = ops.cast(ops.mean(loss), dtype="float32")
+        if self.dense.losses:
+            mean_loss += ops.sum(self.dense.losses)
+        
+        return mean_loss
 
 class MacroPrecision(keras.metrics.Metric):
+    """Macro-averaged precision metric."""
+    
     def __init__(self, num_classes=4, name="macro_precision", **kwargs):
+        """Initializes MacroPrecision metric.
+        
+        Args:
+            num_classes: Number of classes.
+            name: Metric name.
+            **kwargs: Additional metric arguments.
+        """
         super().__init__(name=name, **kwargs)
         self.tp = self.add_weight(name="tp", shape=(num_classes,), initializer="zeros")
         self.fp = self.add_weight(name="fp", shape=(num_classes,), initializer="zeros")
 
     def update_state(self, y_true, y_pred, sample_weight=None):
+        """Updates metric state.
+        
+        Args:
+            y_true: True labels (one-hot).
+            y_pred: Predicted labels (one-hot).
+            sample_weight: Optional sample weights.
+        """
         y_true = ops.cast(y_true, "float32")
         y_pred = ops.cast(y_pred, "float32")
         tp = ops.sum(y_true * y_pred, axis=0)
@@ -236,20 +335,42 @@ class MacroPrecision(keras.metrics.Metric):
         self.fp.assign_add(fp)
 
     def result(self):
+        """Computes the metric result.
+        
+        Returns:
+            Macro-averaged precision.
+        """
         precisions = self.tp / (self.tp + self.fp + 1e-7)
         return ops.mean(precisions)
 
     def reset_state(self):
+        """Resets metric state."""
         self.tp.assign(ops.zeros_like(self.tp))
         self.fp.assign(ops.zeros_like(self.fp))
 
 class MacroRecall(keras.metrics.Metric):
+    """Macro-averaged recall metric."""
+    
     def __init__(self, num_classes=4, name="macro_recall", **kwargs):
+        """Initializes MacroRecall metric.
+        
+        Args:
+            num_classes: Number of classes.
+            name: Metric name.
+            **kwargs: Additional metric arguments.
+        """
         super().__init__(name=name, **kwargs)
         self.tp = self.add_weight(name="tp", shape=(num_classes,), initializer="zeros")
         self.fn = self.add_weight(name="fn", shape=(num_classes,), initializer="zeros")
 
     def update_state(self, y_true, y_pred, sample_weight=None):
+        """Updates metric state.
+        
+        Args:
+            y_true: True labels (one-hot).
+            y_pred: Predicted labels (one-hot).
+            sample_weight: Optional sample weights.
+        """
         y_true = ops.cast(y_true, "float32")
         y_pred = ops.cast(y_pred, "float32")
         tp = ops.sum(y_true * y_pred, axis=0)
@@ -258,10 +379,16 @@ class MacroRecall(keras.metrics.Metric):
         self.fn.assign_add(fn)
 
     def result(self):
+        """Computes the metric result.
+        
+        Returns:
+            Macro-averaged recall.
+        """
         recalls = self.tp / (self.tp + self.fn + 1e-7)
         return ops.mean(recalls)
 
     def reset_state(self):
+        """Resets metric state."""
         self.tp.assign(ops.zeros_like(self.tp))
         self.fn.assign(ops.zeros_like(self.fn))
 
@@ -271,6 +398,19 @@ class FFNetwork(keras.Model):
     def __init__(self, dims, kernel_regularizer=None, learning_rate=0.001, 
                  use_ema=True, ema_overwrite_frequency=None, 
                  layer_epochs=54, threshold=1.143, gamma=1.0337, **kwargs):
+        """Initializes FFNetwork.
+        
+        Args:
+            dims: List of layer dimensions.
+            kernel_regularizer: Kernel regularizer.
+            learning_rate: Learning rate.
+            use_ema: Whether to use exponential moving average.
+            ema_overwrite_frequency: EMA overwrite frequency.
+            layer_epochs: Number of epochs per layer.
+            threshold: Goodness threshold.
+            gamma: Focal loss gamma parameter.
+            **kwargs: Additional model arguments.
+        """
         super().__init__(**kwargs)
         self.loss_var = keras.Variable(0.0, trainable=False)
         self.loss_count = keras.Variable(0.0, trainable=False)
@@ -292,26 +432,67 @@ class FFNetwork(keras.Model):
 
     @property
     def metrics(self):
+        """Returns list of metrics.
+        
+        Returns:
+            List of metric objects.
+        """
         return [self.acc_tracker, self.f1_tracker, self.precision_tracker, self.recall_tracker]
 
     def call(self, x):
+        """Forward pass through the network.
+        
+        Args:
+            x: Input tensor.
+            
+        Returns:
+            Output tensor.
+        """
         h = x
         for layer in self.ff_layers:
             h = layer(h)
         return h
 
     def overlay_y_on_x(self, data):
+        """Overlays label onto input features.
+        
+        Args:
+            data: Tuple of (features, label).
+            
+        Returns:
+            Tuple of (modified features, label).
+        """
         x, y = data
         x_zeros = ops.zeros([4], dtype=x.dtype)
         y_idx = ops.reshape(ops.cast(y, "int32"), [])
-        update = xla.dynamic_update_slice(x_zeros, [ops.cast(10.0, x.dtype)], [y_idx])
-        return xla.dynamic_update_slice(x, update, [0]), y
+        
+        # Create one-hot encoding for the label
+        update = ops.one_hot(y_idx, 4) * 10.0
+        
+        # Update the first 4 positions of x with the label encoding
+        x_updated = ops.concatenate([update, x[4:]], axis=0)
+        return x_updated, y
 
-    @tf.function
     def predict_batch(self, x):
+        """Predicts labels for a batch of inputs.
+        
+        Args:
+            x: Input batch.
+            
+        Returns:
+            Predicted labels.
+        """
         return ops.vectorized_map(self.predict_one, x)
 
     def train_step(self, data):
+        """Performs a single training step.
+        
+        Args:
+            data: Training data (features, labels, optional weights).
+            
+        Returns:
+            Dictionary of metric values.
+        """
         if len(data) == 3:
             x, y, weights = data
             weights = ops.cast(weights, "float32")
@@ -321,9 +502,11 @@ class FFNetwork(keras.Model):
 
         x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
         
-        batch_size = tf.shape(y)[0]
-        offsets = tf.random.uniform(shape=[batch_size], minval=1, maxval=4, dtype=tf.int32)
-        y_neg_labels = (tf.cast(y, tf.int32) + offsets) % 4
+        batch_size = ops.shape(y)[0]
+        # Generate random offsets for negative samples
+        rng = random.PRNGKey(SEED)
+        offsets = random.randint(rng, shape=[batch_size], minval=1, maxval=4)
+        y_neg_labels = (ops.cast(y, "int32") + offsets) % 4
         x_neg, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y_neg_labels))
         
         self.loss_var.assign(0.0)
@@ -351,6 +534,14 @@ class FFNetwork(keras.Model):
         }
 
     def test_step(self, data):
+        """Performs a single validation/test step.
+        
+        Args:
+            data: Validation data (features, labels, optional weights).
+            
+        Returns:
+            Dictionary of metric values.
+        """
         if len(data) == 3:
             x, y, weights = data
             weights = ops.cast(weights, "float32")
@@ -360,9 +551,10 @@ class FFNetwork(keras.Model):
         
         x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
         
-        batch_size = tf.shape(y)[0]
-        offsets = tf.random.stateless_uniform(shape=[batch_size], seed=[SEED, SEED], minval=1, maxval=4, dtype=tf.int32)
-        y_neg_labels = (tf.cast(y, tf.int32) + offsets) % 4
+        batch_size = ops.shape(y)[0]
+        rng = random.PRNGKey(SEED)
+        offsets = random.randint(rng, shape=[batch_size], minval=1, maxval=4)
+        y_neg_labels = (ops.cast(y, "int32") + offsets) % 4
         x_neg, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y_neg_labels))
         
         v_loss = 0.0
@@ -405,6 +597,14 @@ class FFNetwork(keras.Model):
         }
 
     def predict_one(self, x):
+        """Predicts label for a single input.
+        
+        Args:
+            x: Input tensor.
+            
+        Returns:
+            Predicted label.
+        """
         h_all = []
         for label in range(4):
             h, _ = self.overlay_y_on_x((x, label))
@@ -423,18 +623,31 @@ class FFNetwork(keras.Model):
 # --- Hyperband Model ---
 
 class FFHyperModel(kt.HyperModel):
+    """Hyperband model for FF network hyperparameter tuning."""
+    
     def __init__(self, input_dim, total_train_steps):
+        """Initializes FFHyperModel.
+        
+        Args:
+            input_dim: Input dimension.
+            total_train_steps: Total number of training steps.
+        """
         self.input_dim = input_dim
         self.total_train_steps = total_train_steps
 
     def build(self, hp):
-        # Tune the number of layers
+        """Builds a model with hyperparameters.
+        
+        Args:
+            hp: HyperParameters object.
+            
+        Returns:
+            Compiled FFNetwork model.
+        """
+        # Tune the number of layers (4-16)
         num_layers = hp.Int('num_layers', 4, 16)
         
-        # Tune the units per layer
-        # To strictly follow the "layers number 4-16 and units 16-256" request,
-        # we configure uniform width or tunable width per layer.
-        # Uniform width is standard for such hyperband setups unless specified.
+        # Tune the units per layer (16-256)
         units = hp.Int('units', 16, 256, step=16)
         
         # Tune Learning Rate
@@ -448,12 +661,10 @@ class FFHyperModel(kt.HyperModel):
         # Tune Regularization
         l2_reg = hp.Float('l2_reg', 1e-6, 1e-3, sampling='log')
         
-        # Tune EMA frequency (how often weights are overwritten by EMA)
+        # Tune EMA frequency
         ema_overwrite_frequency = hp.Int('ema_overwrite_frequency', 1, 10)
         
-        # Construct dimensions: Input -> Hidden Layers -> Final Layer
-        # Note: Original had a final layer of 32. We can keep it or make it consistent.
-        # We'll make the hidden layers follow the 'units' HP, and keep the final output structure valid.
+        # Construct dimensions: Input -> Hidden Layers -> Output
         dims = [self.input_dim] + [units] * num_layers
         
         lr_schedule = keras.optimizers.schedules.CosineDecay(
@@ -475,14 +686,14 @@ class FFHyperModel(kt.HyperModel):
         
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=lr_schedule, global_clipnorm=1.0),
-            jit_compile=False
+            jit_compile=False  # Disable XLA for TPU compatibility
         )
         return model
 
 # --- Main ---
 
 def main():
-    """Main execution block for Hyperband Tuning."""
+    """Main execution block for Hyperband Tuning on TPU."""
     # Kaggle specific paths
     train_path = "/kaggle/input/barbados-traffic-analysis-challenge/Train.csv"
     
@@ -497,27 +708,34 @@ def main():
     print("Preparing Data for Hyperparameter Search...")
     X_train, y_train, X_val, y_val = create_dataset_splits(train_path)
     
-    # Direct sequential dataset without shuffling or balancing
-    train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
-    train_dataset = train_dataset.shuffle(10000).batch(64).prefetch(tf.data.AUTOTUNE)
+    print(f"Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
+    print(f"Feature dimension: {X_train.shape[1]}")
     
-    val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(64)
-
-    classes = np.unique(y_train)
+    # Convert to NumPy for compatibility with Keras
+    X_train_np = np.array(X_train)
+    y_train_np = np.array(y_train)
+    X_val_np = np.array(X_val)
+    y_val_np = np.array(y_val)
+    
+    # Compute class weights
+    classes = np.unique(y_train_np)
     weights = compute_class_weight(
         class_weight='balanced',
         classes=classes,
-        y=y_train
+        y=y_train_np
     )
     class_weight_dict = dict(zip(classes, weights))
+    
+    print(f"Class weights: {class_weight_dict}")
 
-    global_epochs = 15 # Reduced for tuning speed
-    batch_size = 64
+    # Hyperparameter search configuration
+    global_epochs = 10  # Reduced for TPU tuning speed
+    batch_size = 128  # Larger batch size for TPU efficiency
     local_layer_epochs = 43
-    total_batches = len(X_train) // batch_size
+    total_batches = len(X_train_np) // batch_size
     total_train_steps = global_epochs * total_batches * local_layer_epochs
     
-    input_dim = X_train.shape[1]
+    input_dim = X_train_np.shape[1]
     
     hypermodel = FFHyperModel(input_dim, total_train_steps)
     
@@ -526,16 +744,20 @@ def main():
         objective=kt.Objective("val_acc", direction="max"),
         max_epochs=global_epochs,
         factor=3,
-        seed=42,
+        seed=SEED,
         directory=base_out,
-        project_name='ff_traffic_hyperband',
+        project_name='ff_traffic_hyperband_tpu',
     )
     
-    print("Starting Hyperband Search...")
+    print("Starting Hyperband Search on TPU...")
+    print(f"Max epochs: {global_epochs}, Batch size: {batch_size}")
+    
     tuner.search(
-        train_dataset,
-        validation_data=val_dataset,
+        X_train_np,
+        y_train_np,
+        validation_data=(X_val_np, y_val_np),
         epochs=global_epochs,
+        batch_size=batch_size,
         class_weight=class_weight_dict,
         verbose=1
     )
@@ -543,24 +765,45 @@ def main():
     best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
     
     print(f"""
-    The hyperparameter search is complete. 
-    The optimal number of layers is {best_hps.get('num_layers')}.
-    The optimal number of units is {best_hps.get('units')}.
-    The optimal learning rate is {best_hps.get('learning_rate')}.
+    ========================================
+    Hyperparameter Search Complete!
+    ========================================
+    Optimal number of layers: {best_hps.get('num_layers')}
+    Optimal number of units: {best_hps.get('units')}
+    Optimal learning rate: {best_hps.get('learning_rate'):.6f}
+    Optimal layer epochs: {best_hps.get('layer_epochs')}
+    Optimal threshold: {best_hps.get('threshold'):.3f}
+    Optimal gamma: {best_hps.get('gamma'):.3f}
+    Optimal L2 regularization: {best_hps.get('l2_reg'):.6f}
+    Optimal EMA frequency: {best_hps.get('ema_overwrite_frequency')}
+    ========================================
     """)
     
-    print("Retraining best model...")
+    print("Retraining best model with extended epochs...")
     best_model = tuner.hypermodel.build(best_hps)
     history = best_model.fit(
-        train_dataset,
-        validation_data=val_dataset,
-        epochs=global_epochs + 5, # Train a bit longer
+        X_train_np,
+        y_train_np,
+        validation_data=(X_val_np, y_val_np),
+        epochs=global_epochs + 5,  # Train a bit longer
+        batch_size=batch_size,
         class_weight=class_weight_dict,
         verbose=2
     )
     
-    # Save best model logic or architecture details
-    best_model.save_weights(os.path.join(base_out, "best_ff_weights.weights.h5"))
+    # Save best model weights
+    weights_path = os.path.join(base_out, "best_ff_tpu_weights.weights.h5")
+    best_model.save_weights(weights_path)
+    print(f"Best model weights saved to: {weights_path}")
+    
+    # Save hyperparameters to file
+    hp_path = os.path.join(base_out, "best_hyperparameters.txt")
+    with open(hp_path, 'w') as f:
+        f.write("Best Hyperparameters:\n")
+        f.write("=" * 50 + "\n")
+        for key in best_hps.values.keys():
+            f.write(f"{key}: {best_hps.get(key)}\n")
+    print(f"Hyperparameters saved to: {hp_path}")
 
 if __name__ == "__main__":
     main()
