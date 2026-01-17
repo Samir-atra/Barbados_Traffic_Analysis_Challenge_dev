@@ -1,0 +1,11 @@
+tensorflow
+keras>
+numpy
+pandas
+matplotlib
+scikit-learn
+polars
+jax
+jaxlib
+seaborn
+keras-tuner
