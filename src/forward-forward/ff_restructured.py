@@ -40,6 +40,10 @@ keras.utils.set_random_seed(SEED)
 # Global training flag
 IS_TRAINING = True
 
+# --- Global Model Parameters ---
+HIDDEN_ACTIVATION = 'leaky_relu'
+LAST_LAYER_ACTIVATION = 'softmax'
+
 # --- Data Preparation Helpers ---
 
 def get_features_and_labels(df):
@@ -302,25 +306,27 @@ class FFDense(keras.layers.Layer):
                 - loss: Mean categorical focal loss for this layer.
         """
         y_true_1hot = ops.one_hot(y_true, 4)
-        best_loss = float('inf')
-        wait = 0
+        best_loss = tf.Variable(float('inf'), dtype=tf.float32, trainable=False)
+        wait = tf.Variable(0, dtype=tf.int32, trainable=False)
         
-        for i in range(self.num_epochs):
+        i = tf.constant(0)
+        continue_training = tf.constant(True)
+
+        def loop_cond(i, best_loss, wait, continue_training):
+            return tf.logical_and(tf.less(i, self.num_epochs), continue_training)
+
+        def loop_body(i, best_loss, wait, continue_training):
             with tf.GradientTape() as tape:
-                h_all = self.call(x_all, training=True)
-                # Compute goodness scores for all labels (batch, 4)
-                g_all = ops.mean(ops.power(h_all, 2), axis=-1)
-                # Convert goodness to probabilities via softmax
+                h_all_curr = self.call(x_all, training=True)
+                g_all = ops.mean(ops.power(h_all_curr, 2), axis=-1)
                 probs = ops.softmax(g_all, axis=-1)
                 
-                # Categorical Focal Loss
                 loss = categorical_focal_loss(y_true_1hot, probs, gamma=self.gamma)
                 
                 if weights is not None:
                     loss = loss * weights
                 
                 mean_loss = ops.cast(ops.mean(loss), dtype="float32")
-                # Add regularization losses
                 if self.dense.losses:
                     mean_loss += ops.sum(self.dense.losses)
                 self.loss_metric.update_state([mean_loss])
@@ -328,16 +334,27 @@ class FFDense(keras.layers.Layer):
             grads = tape.gradient(mean_loss, self.dense.trainable_weights)
             self.optimizer.apply_gradients(zip(grads, self.dense.trainable_weights))
 
-            # Early stopping check based on categorical focal loss
-            curr_loss = float(mean_loss)
-            if curr_loss < best_loss - self.min_delta:
-                best_loss = curr_loss
-                wait = 0
-            else:
-                wait += 1
-                if wait >= self.patience:
-                    break
+            # Early stopping check: return new tensor values
+            is_improvement = tf.less(mean_loss, current_best_loss - self.min_delta)
+            
+            new_best_loss = tf.cond(is_improvement, lambda: mean_loss, lambda: current_best_loss)
+            new_wait = tf.cond(is_improvement, lambda: tf.constant(0, dtype=tf.int32), lambda: current_wait + 1)
+            
+            new_continue_training_flag = tf.less(new_wait, self.patience)
+            
+            return i + 1, new_best_loss, new_wait, new_continue_training_flag
 
+        # Execute the while_loop
+        final_i, final_best_loss, final_wait, final_continue_training_flag = tf.while_loop(
+            loop_cond, loop_body, 
+            [i, self.best_loss_var.read_value(), self.wait_var.read_value(), continue_training_flag],
+            maximum_iterations=self.num_epochs
+        )
+
+        # Assign the final values back to the layer's tf.Variables
+        self.best_loss_var.assign(final_best_loss)
+        self.wait_var.assign(final_wait)
+        
         return ops.stop_gradient(self.call(x_all, training=True)), self.loss_metric.result()
 
 @keras.saving.register_keras_serializable(package="MyMetrics")
@@ -418,8 +435,10 @@ class FFNetwork(keras.Model):
 
     def __init__(self, dims, kernel_regularizer=None, learning_rate=0.001, 
                  use_ema=True, ema_overwrite_frequency=None, 
-                 layer_epochs=54, threshold=1.143, gamma=1.0337, 
-                 dropout_rate=0.1, patience=10, min_delta=1e-5, **kwargs):
+                 layer_epochs=54, threshold=1.143, gamma=1.0337,
+                 dropout_rate=0.1, patience=10, min_delta=1e-5,
+                 hidden_activation=HIDDEN_ACTIVATION,
+                 last_layer_activation=LAST_LAYER_ACTIVATION, **kwargs):
         """Initializes the network.
 
         Args:
@@ -433,6 +452,8 @@ class FFNetwork(keras.Model):
             dropout_rate: Dropout rate for hidden layers.
             patience: Early stopping patience for local training.
             min_delta: Early stopping min_delta for local training.
+            hidden_activation: Activation for hidden layers.
+            last_layer_activation: Activation for the last layer.
             **kwargs: Standard model arguments.
         """
         super().__init__(**kwargs)
@@ -447,13 +468,15 @@ class FFNetwork(keras.Model):
         self.dropout_rate = dropout_rate
         self.patience = patience
         self.min_delta = min_delta
+        self.hidden_activation = hidden_activation
+        self.last_layer_activation = last_layer_activation
         
         self.loss_var = keras.Variable(0.0, trainable=False)
         self.loss_count = keras.Variable(0.0, trainable=False)
         self.ff_layers = []
         for i, d in enumerate(dims[1:]):
             # Use softmax for the last layer, LeakyReLU for others
-            act = 'softmax' if i == len(dims[1:]) - 1 else 'leaky_relu'
+            act = self.last_layer_activation if i == len(dims[1:]) - 1 else self.hidden_activation
             self.ff_layers.append(
                 FFDense(d, kernel_regularizer=self.kernel_regularizer, 
                         learning_rate=learning_rate, use_ema=use_ema,
@@ -484,6 +507,8 @@ class FFNetwork(keras.Model):
             "dropout_rate": self.dropout_rate,
             "patience": self.patience,
             "min_delta": self.min_delta,
+            "hidden_activation": self.hidden_activation,
+            "last_layer_activation": self.last_layer_activation,
         })
         return config
 
