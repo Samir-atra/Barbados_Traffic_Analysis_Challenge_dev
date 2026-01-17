@@ -1,5 +1,5 @@
 tensorflow
-keras>
+keras
 numpy
 pandas
 matplotlib

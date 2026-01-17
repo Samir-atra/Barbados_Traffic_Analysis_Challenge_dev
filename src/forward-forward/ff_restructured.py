@@ -169,7 +169,7 @@ class FFDense(keras.layers.Layer):
     and LeakyReLU for stability and employs Focal Loss to handle hard examples.
     """
 
-    def __init__(self, units, num_epochs=54, kernel_regularizer=None, gamma=1.0337, 
+    def __init__(self, units, num_epochs=54, patience=10, min_delta=1e-5, kernel_regularizer=None, gamma=1.0337, 
                  threshold=1.143, learning_rate=0.001, use_ema=True, ema_overwrite_frequency=None, 
                  activation='leaky_relu', **kwargs):
         """Initializes the FFDense layer.
@@ -177,6 +177,8 @@ class FFDense(keras.layers.Layer):
         Args:
             units: Number of hidden units.
             num_epochs: Local training epochs per global epoch.
+            patience: Number of epochs with no improvement after which training will be stopped.
+            min_delta: Minimum change in the monitored loss to qualify as an improvement.
             kernel_regularizer: Keras regularizer for the dense weights.
             gamma: Focusing parameter for Focal Loss.
             learning_rate: Learning rate for the local optimizer.
@@ -187,10 +189,17 @@ class FFDense(keras.layers.Layer):
         super().__init__(**kwargs)
         self.units = units
         self.num_epochs = num_epochs
+        self.patience = patience
+        self.min_delta = min_delta
         self.kernel_regularizer = keras.regularizers.get(kernel_regularizer)
         self.gamma = gamma
         self.threshold = threshold
+        
+        # Handle learning_rate if it's a serialized dict
+        if isinstance(learning_rate, dict):
+            learning_rate = keras.saving.deserialize_keras_object(learning_rate)
         self.learning_rate = learning_rate
+        
         self.use_ema = use_ema
         self.ema_overwrite_frequency = ema_overwrite_frequency
         self.activation_name = activation
@@ -219,6 +228,8 @@ class FFDense(keras.layers.Layer):
         config.update({
             "units": self.units,
             "num_epochs": self.num_epochs,
+            "patience": self.patience,
+            "min_delta": self.min_delta,
             "kernel_regularizer": keras.regularizers.serialize(self.kernel_regularizer),
             "gamma": self.gamma,
             "threshold": self.threshold,
@@ -645,9 +656,9 @@ def main():
     
     # Direct sequential dataset without shuffling or balancing
     train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
-    train_dataset = train_dataset.shuffle(10000).batch(64).prefetch(tf.data.AUTOTUNE)
+    train_dataset = train_dataset.shuffle(10000).batch(128).prefetch(tf.data.AUTOTUNE)
     
-    val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(64)
+    val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(128)
 
     classes = np.unique(y_train)
     weights = compute_class_weight(
@@ -660,7 +671,7 @@ def main():
     # Use L2 regularization to prevent weight explosion
     # Define training hyperparameters for the schedule
     global_epochs = 20
-    batch_size = 64
+    batch_size = 128
     local_layer_epochs = 60 # UPDATED: Tuned value
     total_batches = len(X_train) // batch_size
     total_train_steps = global_epochs * total_batches * local_layer_epochs
@@ -681,7 +692,7 @@ def main():
         kernel_regularizer=reg,
         learning_rate=lr_schedule,
         use_ema=True,
-        ema_overwrite_frequency=10, # UPDATED: Tuned value
+        ema_overwrite_frequency=100, # UPDATED: Tuned value
         layer_epochs=local_layer_epochs, # UPDATED
         threshold=2.0, # UPDATED: Tuned value
         gamma=1.3 # UPDATED: Tuned value
