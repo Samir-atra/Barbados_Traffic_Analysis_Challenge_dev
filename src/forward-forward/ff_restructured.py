@@ -41,7 +41,7 @@ keras.utils.set_random_seed(SEED)
 IS_TRAINING = True
 
 # --- Global Model Parameters ---
-HIDDEN_ACTIVATION = 'leaky_relu'
+HIDDEN_ACTIVATION = 'softmax'
 LAST_LAYER_ACTIVATION = 'softmax'
 
 # --- Data Preparation Helpers ---
@@ -248,6 +248,12 @@ class FFDense(keras.layers.Layer):
             ema_overwrite_frequency=ema_overwrite_frequency
         )
         self.loss_metric = keras.metrics.Mean()
+        
+        # Initialize early stopping variables as tf.Variables
+        self.best_loss_var = tf.Variable(float('inf'), dtype=tf.float32, trainable=False)
+        self.wait_var = tf.Variable(0, dtype=tf.int32, trainable=False)
+        self.continue_training_flag = tf.Variable(True, dtype=tf.bool, trainable=False)
+
 
     def get_config(self):
         config = super().get_config()
@@ -306,16 +312,18 @@ class FFDense(keras.layers.Layer):
                 - loss: Mean categorical focal loss for this layer.
         """
         y_true_1hot = ops.one_hot(y_true, 4)
-        best_loss = tf.Variable(float('inf'), dtype=tf.float32, trainable=False)
-        wait = tf.Variable(0, dtype=tf.int32, trainable=False)
         
+        # Reset early stopping variables for the current local training session
+        self.best_loss_var.assign(float('inf'))
+        self.wait_var.assign(0)
+        self.continue_training_flag.assign(True)
+
         i = tf.constant(0)
-        continue_training = tf.constant(True)
 
         def loop_cond(i, best_loss, wait, continue_training):
             return tf.logical_and(tf.less(i, self.num_epochs), continue_training)
 
-        def loop_body(i, best_loss, wait, continue_training):
+        def loop_body(i, current_best_loss, current_wait, continue_training_flag):
             with tf.GradientTape() as tape:
                 h_all_curr = self.call(x_all, training=True)
                 g_all = ops.mean(ops.power(h_all_curr, 2), axis=-1)
@@ -347,13 +355,14 @@ class FFDense(keras.layers.Layer):
         # Execute the while_loop
         final_i, final_best_loss, final_wait, final_continue_training_flag = tf.while_loop(
             loop_cond, loop_body, 
-            [i, self.best_loss_var.read_value(), self.wait_var.read_value(), continue_training_flag],
+            [i, self.best_loss_var.read_value(), self.wait_var.read_value(), self.continue_training_flag.read_value()],
             maximum_iterations=self.num_epochs
         )
 
         # Assign the final values back to the layer's tf.Variables
         self.best_loss_var.assign(final_best_loss)
         self.wait_var.assign(final_wait)
+        self.continue_training_flag.assign(final_continue_training_flag)
         
         return ops.stop_gradient(self.call(x_all, training=True)), self.loss_metric.result()
 
@@ -722,7 +731,7 @@ def main():
     Loads data, trains the FF network using balanced class sampling,
     visualizes metrics, and generates the final submission file.
     """
-    base = "/home/samer/Desktop/competitions/Barbados_Traffic_Analysis_Challenge_dev"
+    base = "/teamspace/studios/this_studio/Barbados_Traffic_Analysis_Challenge_dev"
     train_path = os.path.join(base, "demos/Train.csv")
     test_path = os.path.join(base, "demos/TestInputSegments.csv")
     
@@ -745,11 +754,12 @@ def main():
 
     # Use L2 regularization to prevent weight explosion
     # Define training hyperparameters for the schedule
-    global_epochs = 20
+    global_epochs = 200
     batch_size = 128
-    local_layer_epochs = 60 # UPDATED: Tuned value
+    local_layer_epochs = 30 # UPDATED: Tuned value. Changed from 0 to 10 to enable CosineDecay.
     total_batches = len(X_train) // batch_size
-    total_train_steps = global_epochs * total_batches * local_layer_epochs
+    # Ensure total_train_steps is at least 1 to avoid ValueError in CosineDecay
+    total_train_steps = max(1, global_epochs * total_batches * local_layer_epochs)
     
     # Global training parameters for layers
     global DROPOUT_RATE, PATIENCE, MIN_DELTA, IS_TRAINING
