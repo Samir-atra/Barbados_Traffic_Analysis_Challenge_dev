@@ -113,7 +113,7 @@ class FFDense(keras.layers.Layer):
     """A single Forward-Forward Dense layer with local learning."""
 
     def __init__(self, units, num_epochs=54, kernel_regularizer=None, gamma=1.0337, 
-                 threshold=1.143, learning_rate=0.001, use_ema=True, ema_overwrite_frequency=1, 
+                 threshold=1.143, learning_rate=0.001, use_ema=True, ema_overwrite_frequency=None, 
                  activation='leaky_relu', **kwargs):
         super().__init__(**kwargs)
         self.units = units
@@ -121,7 +121,12 @@ class FFDense(keras.layers.Layer):
         self.kernel_regularizer = keras.regularizers.get(kernel_regularizer)
         self.gamma = gamma
         self.threshold = threshold
+        
+        # Handle learning_rate if it's a serialized dict
+        if isinstance(learning_rate, dict):
+            learning_rate = keras.optimizers.schedules.deserialize(learning_rate)
         self.learning_rate = learning_rate
+        
         self.use_ema = use_ema
         self.ema_overwrite_frequency = ema_overwrite_frequency
         self.activation_name = activation
@@ -159,9 +164,12 @@ class FFDense(keras.layers.Layer):
         })
         return config
 
+    def build(self, input_shape):
+        self.dense.build(input_shape)
+        super().build(input_shape)
+
     def call(self, x):
-        x_norm = ops.norm(x, ord=2, axis=1, keepdims=True) + 1e-4
-        h = self.dense(x / x_norm)
+        h = self.dense(x)
         return self.activation(h)
 
     def forward_forward(self, x_pos, x_neg, weights=None):
@@ -226,13 +234,21 @@ class FFNetwork(keras.Model):
         super().__init__(**kwargs)
         self.dims = dims
         self.kernel_regularizer = keras.regularizers.get(kernel_regularizer)
+        
+        # Handle learning_rate if it's a serialized dict
+        if isinstance(learning_rate, dict):
+            learning_rate = keras.optimizers.schedules.deserialize(learning_rate)
         self.learning_rate = learning_rate
+        
         self.use_ema = use_ema
         self.ema_overwrite_frequency = ema_overwrite_frequency
         self.layer_epochs = layer_epochs
         self.threshold = threshold
         self.gamma = gamma
 
+        self.loss_var = keras.Variable(0.0, trainable=False)
+        self.loss_count = keras.Variable(0.0, trainable=False)
+        
         self.ff_layers = []
         for i, d in enumerate(dims[1:]):
             act = 'softmax' if i == len(dims[1:]) - 1 else 'leaky_relu'
@@ -248,7 +264,9 @@ class FFNetwork(keras.Model):
         self.f1_tracker = keras.metrics.F1Score(name="f1", average="macro")
         self.precision_tracker = MacroPrecision(name="precision")
         self.recall_tracker = MacroRecall(name="recall")
-        
+        # Explicitly build the model to allow weight saving/loading
+        self.build((None, dims[0]))
+
     def get_config(self):
         config = super().get_config()
         config.update({
@@ -262,6 +280,13 @@ class FFNetwork(keras.Model):
             "gamma": self.gamma,
         })
         return config
+
+    def build(self, input_shape):
+        current_shape = input_shape
+        for layer in self.ff_layers:
+            layer.build(current_shape)
+            current_shape = (current_shape[0], layer.units)
+        super().build(input_shape)
 
     def call(self, x):
         h = x
@@ -302,8 +327,8 @@ def main():
     """Main execution block for inference."""
     # Local paths
     base_dir = "/home/samer/Desktop/competitions/Barbados_Traffic_Analysis_Challenge_dev"
-    test_path = os.path.join(base_dir, "datasets/TestInputSegments.csv")
-    sample_sub_path = os.path.join(base_dir, "datasets/SampleSubmission.csv")
+    test_path = os.path.join(base_dir, "demos/TestInputSegments.csv")
+    sample_sub_path = os.path.join(base_dir, "demos/SampleSubmission.csv")
     
     # Path where model is expected (saved from ff_restructured.py training)
     # Adjust this path if you save your local model in a specific 'models' directory

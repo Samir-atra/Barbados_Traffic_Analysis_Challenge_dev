@@ -160,6 +160,7 @@ def create_dataset_splits(csv_path, val_split=0.2):
 
 # --- Forward-Forward Classes ---
 
+@keras.saving.register_keras_serializable(package="MyLayers")
 class FFDense(keras.layers.Layer):
     """A single Forward-Forward Dense layer with local learning.
     
@@ -185,9 +186,18 @@ class FFDense(keras.layers.Layer):
         """
         super().__init__(**kwargs)
         self.units = units
+        self.num_epochs = num_epochs
+        self.kernel_regularizer = keras.regularizers.get(kernel_regularizer)
+        self.gamma = gamma
+        self.threshold = threshold
+        self.learning_rate = learning_rate
+        self.use_ema = use_ema
+        self.ema_overwrite_frequency = ema_overwrite_frequency
+        self.activation_name = activation
+
         self.dense = keras.layers.Dense(
             units=units, 
-            kernel_regularizer=kernel_regularizer,
+            kernel_regularizer=self.kernel_regularizer,
             kernel_initializer=keras.initializers.GlorotUniform(seed=SEED)
         )
         if activation == 'leaky_relu':
@@ -203,21 +213,36 @@ class FFDense(keras.layers.Layer):
             ema_overwrite_frequency=ema_overwrite_frequency
         )
         self.loss_metric = keras.metrics.Mean()
-        self.threshold = threshold
-        self.num_epochs = num_epochs
-        self.gamma = gamma
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "units": self.units,
+            "num_epochs": self.num_epochs,
+            "kernel_regularizer": keras.regularizers.serialize(self.kernel_regularizer),
+            "gamma": self.gamma,
+            "threshold": self.threshold,
+            "learning_rate": self.learning_rate,
+            "use_ema": self.use_ema,
+            "ema_overwrite_frequency": self.ema_overwrite_frequency,
+            "activation": self.activation_name,
+        })
+        return config
+
+    def build(self, input_shape):
+        self.dense.build(input_shape)
+        super().build(input_shape)
 
     def call(self, x):
-        """Forward pass of the layer with unit-norm normalization.
+        """Forward pass of the layer without normalization.
 
         Args:
             x: Input tensor.
 
         Returns:
-            Normalized and activated layer output.
+            Activated layer output.
         """
-        x_norm = ops.norm(x, ord=2, axis=1, keepdims=True) + 1e-4
-        h = self.dense(x / x_norm)
+        h = self.dense(x)
         return self.activation(h)
 
     def forward_forward(self, x_pos, x_neg, weights=None):
@@ -268,10 +293,12 @@ class FFDense(keras.layers.Layer):
             self.optimizer.apply_gradients(zip(grads, self.dense.trainable_weights))
         return ops.stop_gradient(self.call(x_pos)), ops.stop_gradient(self.call(x_neg)), self.loss_metric.result()
 
+@keras.saving.register_keras_serializable(package="MyMetrics")
 class MacroPrecision(keras.metrics.Metric):
     """Computes Macro-Averaged Precision for multi-class classification."""
     def __init__(self, num_classes=4, name="macro_precision", **kwargs):
         super().__init__(name=name, **kwargs)
+        self.num_classes = num_classes
         self.tp = self.add_weight(name="tp", shape=(num_classes,), initializer="zeros")
         self.fp = self.add_weight(name="fp", shape=(num_classes,), initializer="zeros")
 
@@ -295,11 +322,18 @@ class MacroPrecision(keras.metrics.Metric):
     def reset_state(self):
         self.tp.assign(ops.zeros_like(self.tp))
         self.fp.assign(ops.zeros_like(self.fp))
+        
+    def get_config(self):
+        config = super().get_config()
+        config.update({"num_classes": self.num_classes})
+        return config
 
+@keras.saving.register_keras_serializable(package="MyMetrics")
 class MacroRecall(keras.metrics.Metric):
     """Computes Macro-Averaged Recall for multi-class classification."""
     def __init__(self, num_classes=4, name="macro_recall", **kwargs):
         super().__init__(name=name, **kwargs)
+        self.num_classes = num_classes
         self.tp = self.add_weight(name="tp", shape=(num_classes,), initializer="zeros")
         self.fn = self.add_weight(name="fn", shape=(num_classes,), initializer="zeros")
 
@@ -322,7 +356,13 @@ class MacroRecall(keras.metrics.Metric):
     def reset_state(self):
         self.tp.assign(ops.zeros_like(self.tp))
         self.fn.assign(ops.zeros_like(self.fn))
+        
+    def get_config(self):
+        config = super().get_config()
+        config.update({"num_classes": self.num_classes})
+        return config
 
+@keras.saving.register_keras_serializable(package="MyModels")
 class FFNetwork(keras.Model):
     """The full Forward-Forward network model.
 
@@ -343,6 +383,15 @@ class FFNetwork(keras.Model):
             **kwargs: Standard model arguments.
         """
         super().__init__(**kwargs)
+        self.dims = dims
+        self.kernel_regularizer = keras.regularizers.get(kernel_regularizer)
+        self.learning_rate = learning_rate
+        self.use_ema = use_ema
+        self.ema_overwrite_frequency = ema_overwrite_frequency
+        self.layer_epochs = layer_epochs
+        self.threshold = threshold
+        self.gamma = gamma
+        
         self.loss_var = keras.Variable(0.0, trainable=False)
         self.loss_count = keras.Variable(0.0, trainable=False)
         self.ff_layers = []
@@ -350,7 +399,7 @@ class FFNetwork(keras.Model):
             # Use softmax for the last layer, LeakyReLU for others
             act = 'softmax' if i == len(dims[1:]) - 1 else 'leaky_relu'
             self.ff_layers.append(
-                FFDense(d, kernel_regularizer=kernel_regularizer, 
+                FFDense(d, kernel_regularizer=self.kernel_regularizer, 
                         learning_rate=learning_rate, use_ema=use_ema,
                         ema_overwrite_frequency=ema_overwrite_frequency,
                         num_epochs=layer_epochs, threshold=threshold, gamma=gamma,
@@ -362,6 +411,27 @@ class FFNetwork(keras.Model):
         self.recall_tracker = MacroRecall(name="recall")
         # Explicitly build the model to allow weight saving
         self.build((None, dims[0]))
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "dims": self.dims,
+            "kernel_regularizer": keras.regularizers.serialize(self.kernel_regularizer),
+            "learning_rate": self.learning_rate,
+            "use_ema": self.use_ema,
+            "ema_overwrite_frequency": self.ema_overwrite_frequency,
+            "layer_epochs": self.layer_epochs,
+            "threshold": self.threshold,
+            "gamma": self.gamma,
+        })
+        return config
+
+    def build(self, input_shape):
+        current_shape = input_shape
+        for layer in self.ff_layers:
+            layer.build(current_shape)
+            current_shape = (current_shape[0], layer.units)
+        super().build(input_shape)
 
     @property
     def metrics(self):
@@ -589,32 +659,32 @@ def main():
 
     # Use L2 regularization to prevent weight explosion
     # Define training hyperparameters for the schedule
-    global_epochs = 30
+    global_epochs = 20
     batch_size = 64
-    local_layer_epochs = 43 # UPDATED: Tuned value
+    local_layer_epochs = 60 # UPDATED: Tuned value
     total_batches = len(X_train) // batch_size
     total_train_steps = global_epochs * total_batches * local_layer_epochs
     
     # Cosine Decay Schedule
     lr_schedule = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=0.00074289, # UPDATED: Tuned value
+        initial_learning_rate=0.0090513, # UPDATED: Tuned value
         decay_steps=total_train_steps,
         alpha=0.1
     )
 
     # Use L2 regularization to prevent weight explosion
-    reg = keras.regularizers.L2(1.5576e-05) # UPDATED: Tuned value
+    reg = keras.regularizers.L2(0.00079024) # UPDATED: Tuned value
     # dims[0] must match the feature length (original features + 4-dim one-hot label)
     input_dim = X_train.shape[1]
     model = FFNetwork(
-        dims=[input_dim, 256, 512, 256, 128], # UPDATED: 2 layers of 256 units
+        dims=[input_dim, 128, 128, 128, 128, 128, 128, 64, 64, 64, 64, 32, 16], # UPDATED: 2 layers of 256 units
         kernel_regularizer=reg,
         learning_rate=lr_schedule,
         use_ema=True,
-        ema_overwrite_frequency=1, # UPDATED: Tuned value
+        ema_overwrite_frequency=10, # UPDATED: Tuned value
         layer_epochs=local_layer_epochs, # UPDATED
-        threshold=1.0395, # UPDATED: Tuned value
-        gamma=2.4788 # UPDATED: Tuned value
+        threshold=2.0, # UPDATED: Tuned value
+        gamma=1.3 # UPDATED: Tuned value
     ) 
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr_schedule, global_clipnorm=1.0), 
@@ -629,6 +699,13 @@ def main():
         class_weight=class_weight_dict,
         verbose=2
     )
+    
+    # Save the trained model
+    models_dir = os.path.join(base, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    model_save_path = os.path.join(models_dir, "ff_model.keras")
+    model.save(model_save_path)
+    print(f"Model saved to {model_save_path}")
     
     print("\nVisualizing Metrics...")
     analytics_dir = os.path.join(base, "analytics")

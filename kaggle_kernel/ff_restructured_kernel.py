@@ -708,7 +708,7 @@ def main():
     
     # Architecture from Hyperband: 10 layers of 64 units
     model = FFNetwork(
-        dims=[input_dim] + [64] * 10,
+        dims=[input_dim] + [64] * 5,
         kernel_regularizer=reg,
         learning_rate=lr_schedule,
         use_ema=True,
