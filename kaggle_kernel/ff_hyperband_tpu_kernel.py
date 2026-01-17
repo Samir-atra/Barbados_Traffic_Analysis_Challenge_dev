@@ -5,6 +5,15 @@ Hyperband algorithm for hyperparameter optimization on TPU, specifically targeti
 network depth and width.
 """
 
+# Install required packages
+import subprocess
+import sys
+
+print("Installing polars keras-tuner...")
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "keras-tuner"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "polars"])
+print("Installation complete!")
+
 import os
 import matplotlib
 matplotlib.use('Agg')
@@ -18,15 +27,15 @@ from jax import random
 import keras
 from keras import ops
 import keras_tuner as kt
-import numpy as np
 import polars as pl
 import matplotlib.pyplot as plt
+import numpy as np
 from sklearn.utils.class_weight import compute_class_weight
 import shutil
 
 # Set seeds for reproducibility
 SEED = 42
-np.random.seed(SEED)
+
 keras.utils.set_random_seed(SEED)
 
 # Initialize TPU
@@ -161,7 +170,7 @@ def create_dataset_splits(csv_path, val_split=0.2):
                 windows = feats[indexer].reshape(n_samples, -1)
                 targets = labels[seq_len:]
                 
-                view_X.extend(np.array(windows)) 
+                view_X.extend(jnp.array(windows)) 
                 view_y.extend(targets)
         
         n_total = len(view_X)
@@ -190,7 +199,7 @@ def create_dataset_splits(csv_path, val_split=0.2):
         X_padded = X_padded.at[:, 4:].set(X_arr)
         return X_padded
 
-    return pad_X(train_X), np.array(train_y), pad_X(val_X), np.array(val_y)
+    return pad_X(train_X), jnp.array(train_y), pad_X(val_X), jnp.array(val_y)
 
 # --- Forward-Forward Classes ---
 
@@ -345,8 +354,8 @@ class MacroPrecision(keras.metrics.Metric):
 
     def reset_state(self):
         """Resets metric state."""
-        self.tp.assign(ops.zeros_like(self.tp))
-        self.fp.assign(ops.zeros_like(self.fp))
+        self.tp.assign(jnp.zeros(self.tp.shape, dtype=self.tp.dtype))
+        self.fp.assign(jnp.zeros(self.fp.shape, dtype=self.fp.dtype))
 
 class MacroRecall(keras.metrics.Metric):
     """Macro-averaged recall metric."""
@@ -389,8 +398,8 @@ class MacroRecall(keras.metrics.Metric):
 
     def reset_state(self):
         """Resets metric state."""
-        self.tp.assign(ops.zeros_like(self.tp))
-        self.fn.assign(ops.zeros_like(self.fn))
+        self.tp.assign(ops.zeros(self.tp.shape, dtype=self.tp.dtype))
+        self.fn.assign(ops.zeros(self.fn.shape, dtype=self.fn.dtype))
 
 class FFNetwork(keras.Model):
     """The full Forward-Forward network model."""
@@ -484,23 +493,23 @@ class FFNetwork(keras.Model):
         """
         return ops.vectorized_map(self.predict_one, x)
 
-    def train_step(self, data):
+    def train_step(self, x, y, sample_weight=None):
         """Performs a single training step.
         
         Args:
-            data: Training data (features, labels, optional weights).
+            x: Input features.
+            y: True labels.
+            sample_weight: Optional sample weights.
             
         Returns:
             Dictionary of metric values.
         """
-        if len(data) == 3:
-            x, y, weights = data
-            weights = ops.cast(weights, "float32")
-        else:
-            x, y = data
-            weights = None
-
-        x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
+        if sample_weight is not None:
+            weights = ops.cast(sample_weight, "float32")
+                # Ensure y has at least one dimension for ops.vectorized_map
+                if ops.ndim(y) == 0:
+                    y = ops.expand_dims(y, axis=0)
+                x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
         
         batch_size = ops.shape(y)[0]
         # Generate random offsets for negative samples
@@ -533,20 +542,20 @@ class FFNetwork(keras.Model):
             "recall": self.recall_tracker.result()
         }
 
-    def test_step(self, data):
+    def test_step(self, x, y, sample_weight=None):
         """Performs a single validation/test step.
         
         Args:
-            data: Validation data (features, labels, optional weights).
+            x: Input features.
+            y: True labels.
+            sample_weight: Optional sample weights.
             
         Returns:
             Dictionary of metric values.
         """
-        if len(data) == 3:
-            x, y, weights = data
-            weights = ops.cast(weights, "float32")
+        if sample_weight is not None:
+            weights = ops.cast(sample_weight, "float32")
         else:
-            x, y = data
             weights = None
         
         x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
@@ -711,14 +720,14 @@ def main():
     print(f"Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
     print(f"Feature dimension: {X_train.shape[1]}")
     
-    # Convert to NumPy for compatibility with Keras
-    X_train_np = np.array(X_train)
+    # Convert to NumPy for compatibility with Keras and Scikit-learn
+    X_train_np = jnp.array(X_train)
     y_train_np = np.array(y_train)
-    X_val_np = np.array(X_val)
+    X_val_np = jnp.array(X_val)
     y_val_np = np.array(y_val)
     
     # Compute class weights
-    classes = np.unique(y_train_np)
+    classes = np.array(jnp.unique(y_train_np))
     weights = compute_class_weight(
         class_weight='balanced',
         classes=classes,
