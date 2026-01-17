@@ -37,6 +37,9 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 keras.utils.set_random_seed(SEED)
 
+# Global training flag
+IS_TRAINING = True
+
 # --- Data Preparation Helpers ---
 
 def get_features_and_labels(df):
@@ -158,18 +161,33 @@ def create_dataset_splits(csv_path, val_split=0.2):
 
     return pad_X(train_X), np.array(train_y), pad_X(val_X), np.array(val_y)
 
+def categorical_focal_loss(y_true, y_pred, gamma=2.0):
+    """Computes Categorical Focal Loss using Keras ops.
+    
+    Args:
+        y_true: One-hot encoded ground truth labels.
+        y_pred: Softmax probabilities from the model.
+        gamma: Focusing parameter.
+        
+    Returns:
+        Loss tensor.
+    """
+    y_pred = ops.clip(y_pred, 1e-7, 1.0 - 1e-7)
+    focal_weight = ops.power(1.0 - y_pred, gamma)
+    return -ops.sum(y_true * focal_weight * ops.log(y_pred), axis=-1)
+
 # --- Forward-Forward Classes ---
 
 @keras.saving.register_keras_serializable(package="MyLayers")
 class FFDense(keras.layers.Layer):
-    """A single Forward-Forward Dense layer with local learning.
+    """A single Forward-Forward Dense layer with local categorical focal learning.
     
     This layer implements the core FF logic: it trains itself using local 
     goodness scores without global backpropagation. It includes LayerNorm 
-    and LeakyReLU for stability and employs Focal Loss to handle hard examples.
+    and LeakyReLU for stability and employs Categorical Focal Loss.
     """
 
-    def __init__(self, units, num_epochs=54, patience=10, min_delta=1e-5, kernel_regularizer=None, gamma=1.0337, 
+    def __init__(self, units, num_epochs=54, patience=10, min_delta=1e-5, dropout_rate=0.1, kernel_regularizer=None, gamma=1.0337, 
                  threshold=1.143, learning_rate=0.001, use_ema=True, ema_overwrite_frequency=None, 
                  activation='leaky_relu', **kwargs):
         """Initializes the FFDense layer.
@@ -179,6 +197,7 @@ class FFDense(keras.layers.Layer):
             num_epochs: Local training epochs per global epoch.
             patience: Number of epochs with no improvement after which training will be stopped.
             min_delta: Minimum change in the monitored loss to qualify as an improvement.
+            dropout_rate: Fraction of the input units to drop.
             kernel_regularizer: Keras regularizer for the dense weights.
             gamma: Focusing parameter for Focal Loss.
             learning_rate: Learning rate for the local optimizer.
@@ -191,6 +210,7 @@ class FFDense(keras.layers.Layer):
         self.num_epochs = num_epochs
         self.patience = patience
         self.min_delta = min_delta
+        self.dropout_rate = dropout_rate
         self.kernel_regularizer = keras.regularizers.get(kernel_regularizer)
         self.gamma = gamma
         self.threshold = threshold
@@ -213,6 +233,8 @@ class FFDense(keras.layers.Layer):
             self.activation = keras.layers.LeakyReLU(negative_slope=0.2)
         else:
             self.activation = keras.layers.Activation(activation)
+        
+        self.dropout = keras.layers.Dropout(dropout_rate)
             
         # Apply EMA and Clipping directly to the layer-wise optimizer
         self.optimizer = keras.optimizers.Adam(
@@ -230,6 +252,7 @@ class FFDense(keras.layers.Layer):
             "num_epochs": self.num_epochs,
             "patience": self.patience,
             "min_delta": self.min_delta,
+            "dropout_rate": self.dropout_rate,
             "kernel_regularizer": keras.regularizers.serialize(self.kernel_regularizer),
             "gamma": self.gamma,
             "threshold": self.threshold,
@@ -244,65 +267,78 @@ class FFDense(keras.layers.Layer):
         self.dense.build(input_shape)
         super().build(input_shape)
 
-    def call(self, x):
+    def call(self, x, training=None):
         """Forward pass of the layer without normalization.
 
         Args:
             x: Input tensor.
+            training: Boolean, whether the call is in training mode.
 
         Returns:
             Activated layer output.
         """
+        if training is None:
+            training = IS_TRAINING
         h = self.dense(x)
-        return self.activation(h)
+        h = self.activation(h)
+        if training:
+            h = self.dropout(h, training=training)
+        return h
 
-    def forward_forward(self, x_pos, x_neg, weights=None):
-        """Local training logic using the Forward-Forward algorithm.
+    def forward_forward(self, x_all, y_true, weights=None):
+        """Local training logic using Categorical Focal Loss.
 
-        Updates layer weights to maximize 'goodness' for positive (real) 
-        samples and minimize it for negative (perturbed) samples.
+        Updates layer weights to maximize 'goodness' for the correct label 
+        relative to incorrect labels using Categorical Focal Loss.
 
         Args:
-            x_pos: Real samples with correct labels overlaid.
-            x_neg: Perturbed samples with incorrect labels overlaid.
+            x_all: Input with all 4 classes overlaid (batch, 4, dim).
+            y_true: True integer labels (batch,).
+            weights: Optional sample weights.
 
         Returns:
-            A tuple (h_pos, h_neg, loss):
-                - h_pos: Layer activations for positive samples.
-                - h_neg: Layer activations for negative samples.
-                - loss: Mean focal loss for this layer.
+            A tuple (h_all, loss):
+                - h_all: Layer activations for all 4 class-overlaid versions.
+                - loss: Mean categorical focal loss for this layer.
         """
+        y_true_1hot = ops.one_hot(y_true, 4)
+        best_loss = float('inf')
+        wait = 0
+        
         for i in range(self.num_epochs):
             with tf.GradientTape() as tape:
-                g_pos = ops.mean(ops.power(self.call(x_pos), 2), 1)
-                g_neg = ops.mean(ops.power(self.call(x_neg), 2), 1)
+                h_all = self.call(x_all, training=True)
+                # Compute goodness scores for all labels (batch, 4)
+                g_all = ops.mean(ops.power(h_all, 2), axis=-1)
+                # Convert goodness to probabilities via softmax
+                probs = ops.softmax(g_all, axis=-1)
                 
-                # Standard log-likelihood terms (Binary Cross-Entropy)
-                log_pos = ops.log(1 + ops.exp(-g_pos + self.threshold))
-                log_neg = ops.log(1 + ops.exp(g_neg - self.threshold))
-                
-                # Focal Loss weighting: (1 - p)^gamma
-                # p_pos = sigmoid(g_pos - threshold) -> 1 - p_pos = sigmoid(threshold - g_pos)
-                pt_pos = ops.sigmoid(-g_pos + self.threshold)
-                # p_neg = sigmoid(g_neg - threshold) -> targeting 0, so weight is p_neg^gamma
-                pt_neg = ops.sigmoid(g_neg - self.threshold)
-                
-                loss_pos = ops.power(pt_pos, self.gamma) * log_pos
-                loss_neg = ops.power(pt_neg, self.gamma) * log_neg
+                # Categorical Focal Loss
+                loss = categorical_focal_loss(y_true_1hot, probs, gamma=self.gamma)
                 
                 if weights is not None:
-                    loss_pos = loss_pos * weights
-                    loss_neg = loss_neg * weights
+                    loss = loss * weights
                 
-                loss = ops.concatenate([loss_pos, loss_neg], 0)
                 mean_loss = ops.cast(ops.mean(loss), dtype="float32")
                 # Add regularization losses
                 if self.dense.losses:
                     mean_loss += ops.sum(self.dense.losses)
                 self.loss_metric.update_state([mean_loss])
+                
             grads = tape.gradient(mean_loss, self.dense.trainable_weights)
             self.optimizer.apply_gradients(zip(grads, self.dense.trainable_weights))
-        return ops.stop_gradient(self.call(x_pos)), ops.stop_gradient(self.call(x_neg)), self.loss_metric.result()
+
+            # Early stopping check based on categorical focal loss
+            curr_loss = float(mean_loss)
+            if curr_loss < best_loss - self.min_delta:
+                best_loss = curr_loss
+                wait = 0
+            else:
+                wait += 1
+                if wait >= self.patience:
+                    break
+
+        return ops.stop_gradient(self.call(x_all, training=True)), self.loss_metric.result()
 
 @keras.saving.register_keras_serializable(package="MyMetrics")
 class MacroPrecision(keras.metrics.Metric):
@@ -375,15 +411,15 @@ class MacroRecall(keras.metrics.Metric):
 
 @keras.saving.register_keras_serializable(package="MyModels")
 class FFNetwork(keras.Model):
-    """The full Forward-Forward network model.
+    """The full Forward-Forward network model with Categorical Focal objective.
 
-    Coordinates layer-wise training, prediction via goodness summation, 
-    and custom training/test steps for Keras compatibility.
+    Coordinates layer-wise categorical training and prediction.
     """
 
     def __init__(self, dims, kernel_regularizer=None, learning_rate=0.001, 
                  use_ema=True, ema_overwrite_frequency=None, 
-                 layer_epochs=54, threshold=1.143, gamma=1.0337, **kwargs):
+                 layer_epochs=54, threshold=1.143, gamma=1.0337, 
+                 dropout_rate=0.1, patience=10, min_delta=1e-5, **kwargs):
         """Initializes the network.
 
         Args:
@@ -391,6 +427,12 @@ class FFNetwork(keras.Model):
             kernel_regularizer: Regularizer for all dense layers.
             learning_rate: LR passed to FF layers.
             use_ema: EMA flag passed to FF layers.
+            layer_epochs: Training epochs for each layer.
+            threshold: Goodness threshold.
+            gamma: Focal loss focusing parameter.
+            dropout_rate: Dropout rate for hidden layers.
+            patience: Early stopping patience for local training.
+            min_delta: Early stopping min_delta for local training.
             **kwargs: Standard model arguments.
         """
         super().__init__(**kwargs)
@@ -402,6 +444,9 @@ class FFNetwork(keras.Model):
         self.layer_epochs = layer_epochs
         self.threshold = threshold
         self.gamma = gamma
+        self.dropout_rate = dropout_rate
+        self.patience = patience
+        self.min_delta = min_delta
         
         self.loss_var = keras.Variable(0.0, trainable=False)
         self.loss_count = keras.Variable(0.0, trainable=False)
@@ -414,12 +459,14 @@ class FFNetwork(keras.Model):
                         learning_rate=learning_rate, use_ema=use_ema,
                         ema_overwrite_frequency=ema_overwrite_frequency,
                         num_epochs=layer_epochs, threshold=threshold, gamma=gamma,
-                        activation=act)
+                        dropout_rate=dropout_rate, patience=patience, 
+                        min_delta=min_delta, activation=act)
             )
         self.acc_tracker = keras.metrics.SparseCategoricalAccuracy(name="acc")
         self.f1_tracker = keras.metrics.F1Score(name="f1", average="macro")
         self.precision_tracker = MacroPrecision(name="precision")
         self.recall_tracker = MacroRecall(name="recall")
+        self.focal_tracker = keras.metrics.Mean(name="focal")
         # Explicitly build the model to allow weight saving
         self.build((None, dims[0]))
 
@@ -434,6 +481,9 @@ class FFNetwork(keras.Model):
             "layer_epochs": self.layer_epochs,
             "threshold": self.threshold,
             "gamma": self.gamma,
+            "dropout_rate": self.dropout_rate,
+            "patience": self.patience,
+            "min_delta": self.min_delta,
         })
         return config
 
@@ -447,13 +497,15 @@ class FFNetwork(keras.Model):
     @property
     def metrics(self):
         """Returns the model's metrics for tracking."""
-        return [self.acc_tracker, self.f1_tracker, self.precision_tracker, self.recall_tracker]
+        return [self.acc_tracker, self.f1_tracker, self.precision_tracker, self.recall_tracker, self.focal_tracker]
 
-    def call(self, x):
+    def call(self, x, training=None):
         """Standard forward pass through all layers for Keras tracing."""
+        if training is None:
+            training = IS_TRAINING
         h = x
         for layer in self.ff_layers:
-            h = layer(h)
+            h = layer(h, training=training)
         return h
 
     def overlay_y_on_x(self, data):
@@ -472,13 +524,29 @@ class FFNetwork(keras.Model):
         update = xla.dynamic_update_slice(x_zeros, [ops.cast(10.0, x.dtype)], [y_idx])
         return xla.dynamic_update_slice(x, update, [0]), y
 
+    def overlay_all_labels(self, x):
+        """Creates 4 versions of the input, each with a different class label overlaid.
+        
+        Args:
+            x: Input batch (batch, dim).
+            
+        Returns:
+            Tensor of shape (batch, 4, dim).
+        """
+        def get_all(single_x):
+            res = []
+            for i in range(4):
+                res.append(self.overlay_y_on_x((single_x, i))[0])
+            return ops.stack(res)
+        return ops.vectorized_map(get_all, x)
+
     @tf.function
     def predict_batch(self, x):
         """Predicts labels for a batch of inputs using vectorized_map."""
         return ops.vectorized_map(self.predict_one, x)
 
     def train_step(self, data):
-        """Custom training step implementing layer-wise FF updates."""
+        """Custom training step implementing layer-wise categorical updates."""
         if len(data) == 3:
             x, y, weights = data
             weights = ops.cast(weights, "float32")
@@ -486,43 +554,47 @@ class FFNetwork(keras.Model):
             x, y = data
             weights = None
 
-        x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
-        
-        # Generate negative labels that are strictly different from true labels
-        batch_size = tf.shape(y)[0]
-        # Offsets of 1, 2, or 3 ensure y_neg != y (mod 4)
-        offsets = tf.random.uniform(shape=[batch_size], minval=1, maxval=4, dtype=tf.int32)
-        y_neg_labels = (tf.cast(y, tf.int32) + offsets) % 4
-        x_neg, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y_neg_labels))
+        x_all = self.overlay_all_labels(x)
+        y_true_1hot = ops.one_hot(y, 4)
         
         self.loss_var.assign(0.0)
         self.loss_count.assign(0.0)
         
-        h_pos, h_neg = x_pos, x_neg
+        h_all = x_all
+        total_goodness = ops.zeros((ops.shape(x)[0], 4), dtype="float32")
+        
         for layer in self.ff_layers:
-            h_pos, h_neg, loss = layer.forward_forward(h_pos, h_neg, weights=weights)
+            h_all, loss = layer.forward_forward(h_all, y, weights=weights)
             self.loss_var.assign_add(loss)
             self.loss_count.assign_add(1.0)
+            
+            # Accumulate goodness across layers for the global metric
+            layer_goodness = ops.mean(ops.power(h_all, 2), axis=-1)
+            total_goodness += layer_goodness
+        
+        # Calculate global Categorical Focal Loss for monitoring
+        probs = ops.softmax(total_goodness, axis=-1)
+        global_focal_loss = ops.mean(categorical_focal_loss(y_true_1hot, probs, gamma=self.gamma))
+        self.focal_tracker.update_state(global_focal_loss)
         
         # Update training metrics
-        y_pred = self.predict_batch(x)
+        y_pred = ops.argmax(total_goodness, axis=-1)
         y_pred_1hot = ops.one_hot(y_pred, 4)
-        # Squeeze y to match (batch,) for targets if needed, or update_state handles (batch, 1)
         self.acc_tracker.update_state(y, y_pred_1hot)
-        self.f1_tracker.update_state(ops.one_hot(y, 4), y_pred_1hot)
-        self.precision_tracker.update_state(ops.one_hot(y, 4), y_pred_1hot)
-        self.recall_tracker.update_state(ops.one_hot(y, 4), y_pred_1hot)
+        self.f1_tracker.update_state(y_true_1hot, y_pred_1hot)
+        self.precision_tracker.update_state(y_true_1hot, y_pred_1hot)
+        self.recall_tracker.update_state(y_true_1hot, y_pred_1hot)
         
         return {
-            "loss": self.loss_var / self.loss_count, 
+            "loss": global_focal_loss, 
+            "layer_loss": self.loss_var / self.loss_count,
             "acc": self.acc_tracker.result(),
             "f1": self.f1_tracker.result(),
-            "precision": self.precision_tracker.result(),
-            "recall": self.recall_tracker.result()
+            "focal": self.focal_tracker.result()
         }
 
     def test_step(self, data):
-        """Custom test step for validation set evaluation."""
+        """Custom test step using Categorical Focal objective."""
         if len(data) == 3:
             x, y, weights = data
             weights = ops.cast(weights, "float32")
@@ -530,54 +602,32 @@ class FFNetwork(keras.Model):
             x, y = data
             weights = None
         
-        # Calculate goodness-based loss for validation (layer-wise average)
-        x_pos, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y))
+        x_all = self.overlay_all_labels(x)
+        y_true_1hot = ops.one_hot(y, 4)
         
-        # Deterministic negative labels for validation (strictly different)
-        batch_size = tf.shape(y)[0]
-        offsets = tf.random.stateless_uniform(shape=[batch_size], seed=[SEED, SEED], minval=1, maxval=4, dtype=tf.int32)
-        y_neg_labels = (tf.cast(y, tf.int32) + offsets) % 4
-        x_neg, _ = ops.vectorized_map(self.overlay_y_on_x, (x, y_neg_labels))
-        
-        v_loss = 0.0
-        h_pos, h_neg = x_pos, x_neg
+        total_goodness = ops.zeros((ops.shape(x)[0], 4), dtype="float32")
+        h_all = x_all
         for layer in self.ff_layers:
-            g_pos = ops.mean(ops.power(layer(h_pos), 2), 1)
-            g_neg = ops.mean(ops.power(layer(h_neg), 2), 1)
-            
-            # Focal Loss terms for validation
-            log_pos = ops.log(1 + ops.exp(-g_pos + layer.threshold))
-            log_neg = ops.log(1 + ops.exp(g_neg - layer.threshold))
-            pt_pos = ops.sigmoid(-g_pos + layer.threshold)
-            pt_neg = ops.sigmoid(g_neg - layer.threshold)
-            
-            layer_loss = ops.power(pt_pos, layer.gamma) * log_pos
-            layer_loss_neg = ops.power(pt_neg, layer.gamma) * log_neg
-            
-            if weights is not None:
-                layer_loss = layer_loss * weights
-                layer_loss_neg = layer_loss_neg * weights
-                
-            layer_loss_mean = ops.mean(ops.concatenate([layer_loss, layer_loss_neg], 0))
-            v_loss += ops.cast(layer_loss_mean, "float32")
-            # Next layer inputs
-            h_pos = ops.stop_gradient(layer(h_pos))
-            h_neg = ops.stop_gradient(layer(h_neg))
+            h_all = layer(h_all)
+            layer_goodness = ops.mean(ops.power(h_all, 2), axis=-1)
+            total_goodness += layer_goodness
         
-        v_loss /= len(self.ff_layers)
+        probs = ops.softmax(total_goodness, axis=-1)
+        global_focal_loss = ops.mean(categorical_focal_loss(y_true_1hot, probs, gamma=self.gamma))
+        self.focal_tracker.update_state(global_focal_loss)
 
-        y_pred = self.predict_batch(x)
+        y_pred = ops.argmax(total_goodness, axis=-1)
         y_pred_1hot = ops.one_hot(y_pred, 4)
         self.acc_tracker.update_state(y, y_pred_1hot)
-        self.f1_tracker.update_state(ops.one_hot(y, 4), y_pred_1hot)
-        self.precision_tracker.update_state(ops.one_hot(y, 4), y_pred_1hot)
-        self.recall_tracker.update_state(ops.one_hot(y, 4), y_pred_1hot)
+        self.f1_tracker.update_state(y_true_1hot, y_pred_1hot)
+        self.precision_tracker.update_state(y_true_1hot, y_pred_1hot)
+        self.recall_tracker.update_state(y_true_1hot, y_pred_1hot)
+        
         return {
-            "loss": v_loss,
+            "loss": global_focal_loss,
             "acc": self.acc_tracker.result(),
             "f1": self.f1_tracker.result(),
-            "precision": self.precision_tracker.result(),
-            "recall": self.recall_tracker.result()
+            "focal": self.focal_tracker.result()
         }
 
     def predict_one(self, x):
@@ -676,6 +726,13 @@ def main():
     total_batches = len(X_train) // batch_size
     total_train_steps = global_epochs * total_batches * local_layer_epochs
     
+    # Global training parameters for layers
+    global DROPOUT_RATE, PATIENCE, MIN_DELTA, IS_TRAINING
+    DROPOUT_RATE = 0.15
+    PATIENCE = 8
+    MIN_DELTA = 1e-4
+    IS_TRAINING = True
+
     # Cosine Decay Schedule
     lr_schedule = keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=0.0090513, # UPDATED: Tuned value
@@ -695,7 +752,10 @@ def main():
         ema_overwrite_frequency=100, # UPDATED: Tuned value
         layer_epochs=local_layer_epochs, # UPDATED
         threshold=2.0, # UPDATED: Tuned value
-        gamma=1.3 # UPDATED: Tuned value
+        gamma=1.3, # UPDATED: Tuned value
+        dropout_rate=DROPOUT_RATE,
+        patience=PATIENCE,
+        min_delta=MIN_DELTA
     ) 
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=lr_schedule, global_clipnorm=1.0), 
@@ -721,6 +781,9 @@ def main():
     print("\nVisualizing Metrics...")
     analytics_dir = os.path.join(base, "analytics")
     plot_training_results(history, analytics_dir)
+    
+    # Switch to inference mode
+    IS_TRAINING = False
     
     print("\nInference on TestInputSegments (8-step horizon)...")
     congestion_map = {0: 'free flowing', 1: 'light delay', 2: 'moderate delay', 3: 'heavy delay'}
