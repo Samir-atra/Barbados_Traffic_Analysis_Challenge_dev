@@ -41,8 +41,8 @@ keras.utils.set_random_seed(SEED)
 IS_TRAINING = True
 
 # --- Global Model Parameters ---
-HIDDEN_ACTIVATION = 'softmax'
-LAST_LAYER_ACTIVATION = 'softmax'
+HIDDEN_ACTIVATION = 'leaky_relu'
+LAST_LAYER_ACTIVATION = 'leaky_relu'
 
 # --- Data Preparation Helpers ---
 
@@ -98,8 +98,8 @@ def get_features_and_labels(df):
         view_1hot,
         sig_1hot
     ], axis=1).astype('float32') # 5 base + 4 view-1hot + 4 sig-1hot = 13 features
-    
-    return features, df['enter_id'].values
+    # print(features, len(df))
+    return features#, df['enter_id'].values
 
 def identify_blocks(group):
     """Sorts by time_segment_id and identifies continuous sequential blocks."""
@@ -110,7 +110,7 @@ def identify_blocks(group):
     group['block_id'] = np.cumsum(is_break)
     return group
 
-def create_dataset_splits(csv_path, val_split=0.2):
+def create_dataset_splits(csv_path, val_split):
     """Processes CSV data into sequential training and validation samples.
     
     Groups traffic records by view_label and sequential time blocks. For each
@@ -165,7 +165,7 @@ def create_dataset_splits(csv_path, val_split=0.2):
 
     return pad_X(train_X), np.array(train_y), pad_X(val_X), np.array(val_y)
 
-def categorical_focal_loss(y_true, y_pred, gamma=2.0):
+def categorical_focal_loss(y_true, y_pred, gamma):
     """Computes Categorical Focal Loss using Keras ops.
     
     Args:
@@ -191,9 +191,9 @@ class FFDense(keras.layers.Layer):
     and LeakyReLU for stability and employs Categorical Focal Loss.
     """
 
-    def __init__(self, units, num_epochs=54, patience=10, min_delta=1e-5, dropout_rate=0.1, kernel_regularizer=None, gamma=1.0337, 
-                 threshold=1.143, learning_rate=0.001, use_ema=True, ema_overwrite_frequency=None, 
-                 activation='leaky_relu', **kwargs):
+    def __init__(self, units, num_epochs, patience, min_delta, dropout_rate, kernel_regularizer, gamma, 
+                 threshold, learning_rate, use_ema, ema_overwrite_frequency, 
+                 activation, **kwargs):
         """Initializes the FFDense layer.
 
         Args:
@@ -295,7 +295,7 @@ class FFDense(keras.layers.Layer):
             h = self.dropout(h, training=training)
         return h
 
-    def forward_forward(self, x_all, y_true, weights=None):
+    def forward_forward(self, x_all, y_true, weights):
         """Local training logic using Categorical Focal Loss.
 
         Updates layer weights to maximize 'goodness' for the correct label 
@@ -375,7 +375,7 @@ class MacroPrecision(keras.metrics.Metric):
         self.tp = self.add_weight(name="tp", shape=(num_classes,), initializer="zeros")
         self.fp = self.add_weight(name="fp", shape=(num_classes,), initializer="zeros")
 
-    def update_state(self, y_true, y_pred, sample_weight=None):
+    def update_state(self, y_true, y_pred, sample_weight):
         y_true = ops.cast(y_true, "float32")
         y_pred = ops.cast(y_pred, "float32")
         
@@ -410,7 +410,7 @@ class MacroRecall(keras.metrics.Metric):
         self.tp = self.add_weight(name="tp", shape=(num_classes,), initializer="zeros")
         self.fn = self.add_weight(name="fn", shape=(num_classes,), initializer="zeros")
 
-    def update_state(self, y_true, y_pred, sample_weight=None):
+    def update_state(self, y_true, y_pred, sample_weight):
         y_true = ops.cast(y_true, "float32")
         y_pred = ops.cast(y_pred, "float32")
         
@@ -442,10 +442,10 @@ class FFNetwork(keras.Model):
     Coordinates layer-wise categorical training and prediction.
     """
 
-    def __init__(self, dims, kernel_regularizer=None, learning_rate=0.001, 
-                 use_ema=True, ema_overwrite_frequency=None, 
-                 layer_epochs=54, threshold=1.143, gamma=1.0337,
-                 dropout_rate=0.1, patience=10, min_delta=1e-5,
+    def __init__(self, dims, kernel_regularizer, learning_rate, 
+                 use_ema, ema_overwrite_frequency, 
+                 layer_epochs, threshold, gamma,
+                 dropout_rate, patience, min_delta,
                  hidden_activation=HIDDEN_ACTIVATION,
                  last_layer_activation=LAST_LAYER_ACTIVATION, **kwargs):
         """Initializes the network.
@@ -533,7 +533,7 @@ class FFNetwork(keras.Model):
         """Returns the model's metrics for tracking."""
         return [self.acc_tracker, self.f1_tracker, self.precision_tracker, self.recall_tracker, self.focal_tracker]
 
-    def call(self, x, training=None):
+    def call(self, x, training):
         """Standard forward pass through all layers for Keras tracing."""
         if training is None:
             training = IS_TRAINING
@@ -616,8 +616,8 @@ class FFNetwork(keras.Model):
         y_pred_1hot = ops.one_hot(y_pred, 4)
         self.acc_tracker.update_state(y, y_pred_1hot)
         self.f1_tracker.update_state(y_true_1hot, y_pred_1hot)
-        self.precision_tracker.update_state(y_true_1hot, y_pred_1hot)
-        self.recall_tracker.update_state(y_true_1hot, y_pred_1hot)
+        self.precision_tracker.update_state(y_true_1hot, y_pred_1hot, sample_weight=None)
+        self.recall_tracker.update_state(y_true_1hot, y_pred_1hot, sample_weight=None)
         
         return {
             "loss": global_focal_loss, 
@@ -654,8 +654,8 @@ class FFNetwork(keras.Model):
         y_pred_1hot = ops.one_hot(y_pred, 4)
         self.acc_tracker.update_state(y, y_pred_1hot)
         self.f1_tracker.update_state(y_true_1hot, y_pred_1hot)
-        self.precision_tracker.update_state(y_true_1hot, y_pred_1hot)
-        self.recall_tracker.update_state(y_true_1hot, y_pred_1hot)
+        self.precision_tracker.update_state(y_true_1hot, y_pred_1hot, sample_weight=None)
+        self.recall_tracker.update_state(y_true_1hot, y_pred_1hot, sample_weight=None)
         
         return {
             "loss": global_focal_loss,
@@ -736,7 +736,7 @@ def main():
     test_path = os.path.join(base, "demos/TestInputSegments.csv")
     
     print("Preparing Data...")
-    X_train, y_train, X_val, y_val = create_dataset_splits(train_path)
+    X_train, y_train, X_val, y_val = create_dataset_splits(train_path, val_split=0.2)
     
     # Direct sequential dataset without shuffling or balancing
     train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
@@ -754,16 +754,16 @@ def main():
 
     # Use L2 regularization to prevent weight explosion
     # Define training hyperparameters for the schedule
-    global_epochs = 200
+    global_epochs = 100
     batch_size = 128
-    local_layer_epochs = 30 # UPDATED: Tuned value. Changed from 0 to 10 to enable CosineDecay.
+    local_layer_epochs = 20 # UPDATED: Tuned value. Changed from 0 to 10 to enable CosineDecay.
     total_batches = len(X_train) // batch_size
     # Ensure total_train_steps is at least 1 to avoid ValueError in CosineDecay
     total_train_steps = max(1, global_epochs * total_batches * local_layer_epochs)
     
     # Global training parameters for layers
     global DROPOUT_RATE, PATIENCE, MIN_DELTA, IS_TRAINING
-    DROPOUT_RATE = 0.15
+    DROPOUT_RATE = 0.3
     PATIENCE = 8
     MIN_DELTA = 1e-4
     IS_TRAINING = True
@@ -776,17 +776,17 @@ def main():
     )
 
     # Use L2 regularization to prevent weight explosion
-    reg = keras.regularizers.L2(0.00079024) # UPDATED: Tuned value
+    reg = keras.regularizers.L2(0.000079024) # UPDATED: Tuned value
     # dims[0] must match the feature length (original features + 4-dim one-hot label)
     input_dim = X_train.shape[1]
     model = FFNetwork(
-        dims=[input_dim, 128, 128, 128, 128, 128, 128, 64, 64, 64, 64, 32, 16], # UPDATED: 2 layers of 256 units
+        dims=[input_dim, 128, 128, 128, 128, 64, 64, 64, 32, 16], # UPDATED: 2 layers of 256 units
         kernel_regularizer=reg,
         learning_rate=lr_schedule,
         use_ema=True,
         ema_overwrite_frequency=100, # UPDATED: Tuned value
         layer_epochs=local_layer_epochs, # UPDATED
-        threshold=2.0, # UPDATED: Tuned value
+        threshold=1.5, # UPDATED: Tuned value
         gamma=1.3, # UPDATED: Tuned value
         dropout_rate=DROPOUT_RATE,
         patience=PATIENCE,
