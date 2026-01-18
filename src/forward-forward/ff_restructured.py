@@ -113,10 +113,9 @@ def identify_blocks(group):
 def create_dataset_splits(csv_path, val_split):
     """Processes CSV data into sequential training and validation samples.
     
-    Groups traffic records by view_label and sequential time blocks. For each
-    block, it creates input/target pairs where input is the current state
-    and target is the congestion level at the next time step. Splits are done
-    per view to ensure all views are represented in both sets.
+    Groups traffic records by view_label and sequential time blocks. Splits
+    each block temporally BEFORE creating windows to prevent data leakage
+    (adjacent windows sharing timesteps across train/val boundary).
 
     Args:
         csv_path: Path to the Train.csv file.
@@ -134,27 +133,34 @@ def create_dataset_splits(csv_path, val_split):
     for label, group in df.groupby('view_label'):
         print(f"  Processing view: {label}")
         group = identify_blocks(group)
-        view_X, view_y = [], []
         
         for b_id, block in group.groupby('block_id'):
-            if len(block) < seq_len + 1: continue
-            feats, labels = get_features_and_labels(block)
-            for i in range(len(feats) - seq_len):
-                # Concatenate 15 steps of features: [Xt-14, ..., Xt]
-                window = feats[i : i + seq_len].flatten()
-                view_X.append(window)
-                view_y.append(labels[i + seq_len])
-        
-        # Split this view's data
-        n_total = len(view_X)
-        if n_total > 0:
-            n_val = int(n_total * val_split)
-            n_train = n_total - n_val
+            if len(block) < seq_len + 1: 
+                continue
             
-            train_X.extend(view_X[:n_train])
-            train_y.extend(view_y[:n_train])
-            val_X.extend(view_X[n_train:])
-            val_y.extend(view_y[n_train:])
+            # CRITICAL FIX: Split block BEFORE creating windows to prevent
+            # temporal data leakage (overlapping windows at boundary)
+            n_block = len(block)
+            n_train_rows = int(n_block * (1 - val_split))
+            
+            train_block = block.iloc[:n_train_rows]
+            val_block = block.iloc[n_train_rows:]
+            
+            # Create training windows from train portion only
+            if len(train_block) >= seq_len + 1:
+                train_feats, train_labels = get_features_and_labels(train_block)
+                for i in range(len(train_feats) - seq_len):
+                    window = train_feats[i : i + seq_len].flatten()
+                    train_X.append(window)
+                    train_y.append(train_labels[i + seq_len])
+            
+            # Create validation windows from val portion only
+            if len(val_block) >= seq_len + 1:
+                val_feats, val_labels = get_features_and_labels(val_block)
+                for i in range(len(val_feats) - seq_len):
+                    window = val_feats[i : i + seq_len].flatten()
+                    val_X.append(window)
+                    val_y.append(val_labels[i + seq_len])
                 
     # Convert to arrays and pad with label buffer
     def pad_X(X_list):
