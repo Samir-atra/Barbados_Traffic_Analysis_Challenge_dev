@@ -98,8 +98,8 @@ def get_features_and_labels(df):
         view_1hot,
         sig_1hot
     ], axis=1).astype('float32') # 5 base + 4 view-1hot + 4 sig-1hot = 13 features
-    # print(features, len(df))
-    return features#, df['enter_id'].values
+
+    return features, df['enter_id'].values
 
 def identify_blocks(group):
     """Sorts by time_segment_id and identifies continuous sequential blocks."""
@@ -277,7 +277,7 @@ class FFDense(keras.layers.Layer):
         self.dense.build(input_shape)
         super().build(input_shape)
 
-    def call(self, x, training=None):
+    def call(self, x, training):
         """Forward pass of the layer without normalization.
 
         Args:
