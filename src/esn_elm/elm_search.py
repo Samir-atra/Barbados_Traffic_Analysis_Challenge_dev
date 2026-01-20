@@ -112,8 +112,14 @@ def create_dataset_splits(csv_path, val_split=0.2, seq_len=15):
                 vx, vy = make_windows(val_block)
                 val_X.extend(vx)
                 val_y.extend(vy)
+
+    train_y_np, val_y_np = np.array(train_y), np.array(val_y)
+    t_cls, t_cnt = np.unique(train_y_np, return_counts=True)
+    v_cls, v_cnt = np.unique(val_y_np, return_counts=True)
+    print(f"Loaded {len(train_y_np)} train samples with class counts: {dict(zip(t_cls, t_cnt))}")
+    print(f"Loaded {len(val_y_np)} val samples with class counts: {dict(zip(v_cls, v_cnt))}")
                 
-    return np.array(train_X), np.array(train_y), np.array(val_X), np.array(val_y)
+    return np.array(train_X), train_y_np, np.array(val_X), val_y_np
 
 class ELMClassifier:
     """Extreme Learning Machine for Multi-class Classification."""
@@ -150,6 +156,8 @@ class ELMClassifier:
         return H
 
     def fit(self, X, y, class_weights=None):
+        classes, counts = np.unique(y, return_counts=True)
+        print(f"Input to Model - Class Counts: {dict(zip(classes, counts))}")
         """Train the ELM with optional class weighting."""
         # 1. Scale Input
         X = self.scaler.fit_transform(X)
@@ -210,6 +218,12 @@ def main():
     
     print("Preparing ELM Data...")
     X_train, y_train, X_val, y_val = create_dataset_splits(train_path, val_split=0.2)
+    
+    t_cls, t_cnt = np.unique(y_train, return_counts=True)
+    v_cls, v_cnt = np.unique(y_val, return_counts=True)
+    print(f"Loaded Train class counts: {dict(zip(t_cls, t_cnt))}")
+    print(f"Loaded Val class counts:   {dict(zip(v_cls, v_cnt))}")
+    
     print(f"Train Shape: {X_train.shape}, Val Shape: {X_val.shape}")
     
     # Calculate Class Weights

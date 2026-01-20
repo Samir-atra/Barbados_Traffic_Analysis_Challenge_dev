@@ -101,8 +101,14 @@ def create_dataset_splits(csv_path, val_split=0.2, seq_len=15):
                 vx, vy = make_windows(val_block)
                 val_X.extend(vx)
                 val_y.extend(vy)
+
+    train_y_np, val_y_np = np.array(train_y), np.array(val_y)
+    t_cls, t_cnt = np.unique(train_y_np, return_counts=True)
+    v_cls, v_cnt = np.unique(val_y_np, return_counts=True)
+    print(f"Loaded {len(train_y_np)} train samples with class counts: {dict(zip(t_cls, t_cnt))}")
+    print(f"Loaded {len(val_y_np)} val samples with class counts: {dict(zip(v_cls, v_cnt))}")
                 
-    return np.array(train_X), np.array(train_y), np.array(val_X), np.array(val_y)
+    return np.array(train_X), train_y_np, np.array(val_X), val_y_np
 
 class ELMClassifier:
     def __init__(self, hidden_units=1000, alpha=1.0, activation='relu', scale=1.0, seed=42):
@@ -124,6 +130,8 @@ class ELMClassifier:
         return H
 
     def fit(self, X, y, class_weights=None):
+        classes, counts = np.unique(y, return_counts=True)
+        print(f"Input to Model - Class Counts: {dict(zip(classes, counts))}")
         X = self.scaler.fit_transform(X)
         n_samples, n_features = X.shape
         
@@ -166,6 +174,11 @@ def main():
     
     print("Preparing Data...")
     X_train, y_train, X_val, y_val = create_dataset_splits(train_path, val_split=0.2)
+    
+    t_cls, t_cnt = np.unique(y_train, return_counts=True)
+    v_cls, v_cnt = np.unique(y_val, return_counts=True)
+    print(f"Loaded Train class counts: {dict(zip(t_cls, t_cnt))}")
+    print(f"Loaded Val class counts:   {dict(zip(v_cls, v_cnt))}")
     
     classes = np.unique(y_train)
     weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)

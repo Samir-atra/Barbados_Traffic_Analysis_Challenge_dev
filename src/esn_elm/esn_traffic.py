@@ -12,30 +12,58 @@ Training involves:
 NO backpropagation through time (BPTT) is used.
 
 Workflow:
-1. Load Train.csv and format into sequential blocks (N, 15, Features).
+1. Load Train.csv with improved chunked data loading.
 2. Run sequences through ESN Reservoir.
 3. Train Readout Layer (Ridge Regression).
 4. Predict on Test Set.
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.preprocessing import StandardScaler
 from scipy import sparse
 
+# Add data_processing to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'data_processing'))
+from chunked_data_loader import create_raw_sequences_chunked, CHUNK_SIZE, SEQ_LEN
+
 # Set seeds for reproducibility
 SEED = 42
 np.random.seed(SEED)
 
+
 def get_features_and_labels(df):
-    """Extracts features and labels."""
+    """Extracts features and labels with enhanced feature engineering."""
     df = df.copy()
     df['video_time'] = pd.to_datetime(df['video_time'])
-    df['hour'] = df['video_time'].dt.hour / 23.0
-    df['minute'] = df['video_time'].dt.minute / 59.0
-    df['day_of_week'] = pd.to_datetime(df['date']).dt.dayofweek / 6.0
+    
+    # Extract raw time values
+    hour = df['video_time'].dt.hour
+    minute = df['video_time'].dt.minute
+    day_of_week = pd.to_datetime(df['date']).dt.dayofweek
+    
+    # Cyclical encoding for hour (captures 24-hour cycle)
+    df['hour_sin'] = np.sin(2 * np.pi * hour / 24.0)
+    df['hour_cos'] = np.cos(2 * np.pi * hour / 24.0)
+    
+    # Cyclical encoding for minute
+    df['minute_sin'] = np.sin(2 * np.pi * minute / 60.0)
+    df['minute_cos'] = np.cos(2 * np.pi * minute / 60.0)
+    
+    # Cyclical encoding for day of week
+    df['dow_sin'] = np.sin(2 * np.pi * day_of_week / 7.0)
+    df['dow_cos'] = np.cos(2 * np.pi * day_of_week / 7.0)
+    
+    # Peak hour indicators (rush hours: 7-9 AM, 4-6 PM)
+    df['is_morning_rush'] = ((hour >= 7) & (hour <= 9)).astype(float)
+    df['is_evening_rush'] = ((hour >= 16) & (hour <= 18)).astype(float)
+    
+    # Linear time features (keep for additional signal)
+    df['hour_norm'] = hour / 23.0
+    df['minute_norm'] = minute / 59.0
     
     view_map = {
         'Norman Niles #1': 0, 
@@ -70,11 +98,20 @@ def get_features_and_labels(df):
     sig_1hot = pd.get_dummies(df['sig_id'], prefix='sig').reindex(
         columns=['sig_0', 'sig_1', 'sig_2', 'sig_3'], fill_value=0).astype(float).values
     
+    # Enhanced feature set: 21 features total
     features = np.concatenate([
-        df[['hour', 'minute', 'day_of_week', 'seg_id_norm', 'view_id']].values,
+        # Cyclical time features (6)
+        df[['hour_sin', 'hour_cos', 'minute_sin', 'minute_cos', 'dow_sin', 'dow_cos']].values,
+        # Peak hour indicators (2)
+        df[['is_morning_rush', 'is_evening_rush']].values,
+        # Linear time + segment (3)
+        df[['hour_norm', 'minute_norm', 'seg_id_norm']].values,
+        # View ID (1) + one-hot (4)
+        df[['view_id']].values,
         view_1hot,
+        # Signaling one-hot (4)
         sig_1hot
-    ], axis=1).astype('float32') # 13 features
+    ], axis=1).astype('float32')
 
     return features, labels
 
@@ -124,14 +161,21 @@ def create_raw_sequences(csv_path, val_split=0.2, seq_len=15):
                 vx, vy = make_seqs(val_block)
                 val_X.extend(vx)
                 val_y.extend(vy)
+
+    train_y_np, val_y_np = np.array(train_y), np.array(val_y)
+    t_cls, t_cnt = np.unique(train_y_np, return_counts=True)
+    v_cls, v_cnt = np.unique(val_y_np, return_counts=True)
+    print(f"Loaded {len(train_y_np)} train samples with class counts: {dict(zip(t_cls, t_cnt))}")
+    print(f"Loaded {len(val_y_np)} val samples with class counts: {dict(zip(v_cls, v_cnt))}")
                 
-    return np.array(train_X), np.array(train_y), np.array(val_X), np.array(val_y)
+    return np.array(train_X), train_y_np, np.array(val_X), val_y_np
 
 class ESNClassifier:
     """Echo State Network for Sequence Classification."""
     
     def __init__(self, input_dim, reservoir_dim=500, spectral_radius=0.9, 
-                 leak_rate=0.3, sparsity=0.1, alpha=1.0, seed=42):
+                 leak_rate=0.3, sparsity=0.1, alpha=1.0, washout=0, 
+                 state_avg_steps=3, input_scale=1.0, seed=42):
         """
         Args:
             input_dim: Number of input features.
@@ -140,22 +184,25 @@ class ESNClassifier:
             leak_rate: Leaking rate (alpha) in state update.
             sparsity: Probability of connection in reservoir.
             alpha: Ridge regression regularization.
+            washout: Number of initial time steps to discard (warm-up period).
+            state_avg_steps: Number of final states to average for classification.
+            input_scale: Scaling factor for input weights.
         """
         self.reservoir_dim = reservoir_dim
         self.leak_rate = leak_rate
         self.alpha = alpha
+        self.washout = washout
+        self.state_avg_steps = state_avg_steps
+        self.input_scale = input_scale
         self.rng = np.random.default_rng(seed)
         
-        # 1. Input Weights (Dense, Random)
-        # Uniform [-0.5, 0.5]
-        self.W_in = (self.rng.random((reservoir_dim, input_dim)) - 0.5)
+        # 1. Input Weights (Dense, Random, Scaled)
+        self.W_in = (self.rng.random((reservoir_dim, input_dim)) - 0.5) * input_scale
         
         # 2. Reservoir Weights (Sparse, Random)
-        # Create sparse random matrix
         W = sparse.random(reservoir_dim, reservoir_dim, density=sparsity, random_state=seed)
-        # Get eigenvalues to scale spectral radius
         eigenvalues = np.linalg.eigvals(W.toarray())
-        max_eigen = np.max(np.abs(eigenvalues))
+        max_eigen = np.max(np.abs(eigenvalues)) + 1e-10
         self.W_res = W * (spectral_radius / max_eigen)
         
         self.W_out = None
@@ -165,34 +212,33 @@ class ESNClassifier:
         """Run reservoir dynamics on batch of sequences."""
         n_samples, n_steps, _ = X.shape
         
-        # Initialize states
-        # Can be done sample-by-sample or batched if memory allows. 
-        # For simplicity and speed in Python, we do loop over time steps for the whole batch.
-        
         states = np.zeros((n_samples, self.reservoir_dim))
-        
-        # X is (N, T, F)
-        # W_in is (Res, F) -> X @ W_in.T -> (N, Res)
-        # W_res is (Res, Res) (sparse)
+        all_states = []  # Store all states for multi-step averaging
         
         for t in range(n_steps):
-            u_t = X[:, t, :] # (N, F)
+            u_t = X[:, t, :]
             
-            # Input contribution
-            input_part = np.dot(u_t, self.W_in.T) # (N, Res)
+            input_part = np.dot(u_t, self.W_in.T)
+            res_part = self.W_res.dot(states.T).T
             
-            # Recurrent contribution
-            # W_res is sparse, so use safe sparse dot or dense dot
-            res_part = self.W_res.dot(states.T).T # (N, Res)
-            
-            # Update state
-            # x_t = (1-a)x_{t-1} + a * tanh(Win*u + Wres*x)
             update = np.tanh(input_part + res_part)
             states = (1 - self.leak_rate) * states + self.leak_rate * update
             
-        return states # Return state after LAST time step for classification
+            all_states.append(states.copy())
+        
+        # Multi-step state averaging: average the last N states
+        if self.state_avg_steps > 1 and len(all_states) >= self.state_avg_steps:
+            # Stack last N states and average
+            last_states = np.stack(all_states[-self.state_avg_steps:], axis=0)  # (N_steps, N_samples, Res)
+            avg_states = np.mean(last_states, axis=0)  # (N_samples, Res)
+            return avg_states
+        else:
+            return states  # Return final state only
     
-    def fit(self, X, y):
+    def fit(self, X, y, class_weights=None):
+        classes, counts = np.unique(y, return_counts=True)
+        print(f"Input to Model - Class Counts: {dict(zip(classes, counts))}")
+        
         # Flatten time and features for scaling (ignoring sequence nature for scaling stats)
         # Actually scaling per feature across all (N*T) is best
         N, T, F = X.shape
@@ -209,6 +255,13 @@ class ESNClassifier:
         # Targets
         n_classes = 4
         Y_onehot = np.eye(n_classes)[y]
+        
+        # Apply Class Weights if provided
+        if class_weights is not None:
+            sample_weights = np.array([class_weights[label] for label in y])
+            S_sqrt = np.sqrt(sample_weights)[:, None]
+            states_bias = states_bias * S_sqrt
+            Y_onehot = Y_onehot * S_sqrt
         
         # Ridge Regression
         # W_out = (S^T S + alpha*I)^-1 S^T Y
@@ -240,31 +293,56 @@ def main():
     test_path = os.path.join(base, "demos/TestInputSegments.csv")
     sample_sub_path = os.path.join(base, "demos/SampleSubmission.csv")
     
-    print("Preparing ESN Data (Sequences)...")
-    X_train, y_train, X_val, y_val = create_raw_sequences(train_path, val_split=0.2)
+    print("Preparing ESN Data (Chunked Sequences)...")
+    X_train, y_train, X_val, y_val = create_raw_sequences_chunked(
+        train_path, val_split=0.2, seq_len=SEQ_LEN, chunk_size=CHUNK_SIZE)
+    
+    t_cls, t_cnt = np.unique(y_train, return_counts=True)
+    v_cls, v_cnt = np.unique(y_val, return_counts=True)
+    print(f"Train data classes: {dict(zip(t_cls, t_cnt))}")
+    print(f"Val data classes:   {dict(zip(v_cls, v_cnt))}")
     print(f"Train Sequence Shape: {X_train.shape}, Val: {X_val.shape}")
     
-    # ESN Params
+    # ESN Params - Optimized for performance
     input_dim = X_train.shape[2] 
     esn = ESNClassifier(input_dim=input_dim, 
-                        reservoir_dim=800, 
+                        reservoir_dim=2500,  # Balanced size
                         spectral_radius=0.95, 
                         leak_rate=0.2, 
-                        sparsity=0.2,
-                        alpha=10.0)
+                        sparsity=0.05,
+                        alpha=50.0,
+                        input_scale=0.8,
+                        state_avg_steps=5,
+                        seed=42)
     
     print("Training ESN...")
-    esn.fit(X_train, y_train)
+    # Calculate Class Weights to handle imbalance
+    from sklearn.utils.class_weight import compute_class_weight
+    classes = np.unique(y_train)
+    weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)
+    class_weight_dict = dict(zip(classes, weights))
+    print(f"Class Weights: {class_weight_dict}")
     
-    print("Evaluating...")
+    esn.fit(X_train, y_train, class_weights=class_weight_dict)
+    
+    print("\nEvaluating on Training Data...")
+    train_pred = esn.predict(X_train)
+    train_f1 = f1_score(y_train, train_pred, average='macro')
+    train_acc = accuracy_score(y_train, train_pred)
+    print(f"Train Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}")
+
+    print("\nEvaluating on Validation Data...")
     val_pred = esn.predict(X_val)
     
     acc = accuracy_score(y_val, val_pred)
     f1 = f1_score(y_val, val_pred, average='macro')
+    prec = precision_score(y_val, val_pred, average='macro')
+    rec = recall_score(y_val, val_pred, average='macro')
     
-    print(f"\nESN Validation Metrics:")
-    print(f"Accuracy:  {acc:.4f}")
-    print(f"F1 Macro:  {f1:.4f}")
+    print(f"Val Accuracy:  {acc:.4f}")
+    print(f"Val F1 Macro:  {f1:.4f}")
+    print(f"Val Precision: {prec:.4f}")
+    print(f"Val Recall:    {rec:.4f}")
     
     # Inference
     print("\nStarting Inference...")
