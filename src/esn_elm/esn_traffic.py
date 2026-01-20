@@ -28,147 +28,16 @@ from scipy import sparse
 
 # Add data_processing to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'data_processing'))
-from chunked_data_loader import create_raw_sequences_chunked, CHUNK_SIZE, SEQ_LEN
+from chunked_data_loader import create_raw_sequences_chunked, get_features_and_labels, CHUNK_SIZE, SEQ_LEN, DOWNSAMPLE_FACTOR
 
 # Set seeds for reproducibility
 SEED = 42
 np.random.seed(SEED)
 
 
-def get_features_and_labels(df):
-    """Extracts features and labels with enhanced feature engineering."""
-    df = df.copy()
-    df['video_time'] = pd.to_datetime(df['video_time'])
-    
-    # Extract raw time values
-    hour = df['video_time'].dt.hour
-    minute = df['video_time'].dt.minute
-    day_of_week = pd.to_datetime(df['date']).dt.dayofweek
-    
-    # Cyclical encoding for hour (captures 24-hour cycle)
-    df['hour_sin'] = np.sin(2 * np.pi * hour / 24.0)
-    df['hour_cos'] = np.cos(2 * np.pi * hour / 24.0)
-    
-    # Cyclical encoding for minute
-    df['minute_sin'] = np.sin(2 * np.pi * minute / 60.0)
-    df['minute_cos'] = np.cos(2 * np.pi * minute / 60.0)
-    
-    # Cyclical encoding for day of week
-    df['dow_sin'] = np.sin(2 * np.pi * day_of_week / 7.0)
-    df['dow_cos'] = np.cos(2 * np.pi * day_of_week / 7.0)
-    
-    # Peak hour indicators (rush hours: 7-9 AM, 4-6 PM)
-    df['is_morning_rush'] = ((hour >= 7) & (hour <= 9)).astype(float)
-    df['is_evening_rush'] = ((hour >= 16) & (hour <= 18)).astype(float)
-    
-    # Linear time features (keep for additional signal)
-    df['hour_norm'] = hour / 23.0
-    df['minute_norm'] = minute / 59.0
-    
-    view_map = {
-        'Norman Niles #1': 0, 
-        'Norman Niles #2': 1, 
-        'Norman Niles #3': 2, 
-        'Norman Niles #4': 3
-    }
-    df['view_id'] = df['view_label'].map(view_map)
-    df['seg_id_norm'] = df['time_segment_id'] / 5000.0
-    
-    congestion_map = {
-        'free flowing': 0,
-        'light delay': 1,
-        'moderate delay': 2,
-        'heavy delay': 3
-    }
-    if 'congestion_enter_rating' in df.columns:
-        df['enter_id'] = df['congestion_enter_rating'].map(congestion_map).fillna(0).astype(int)
-        labels = df['enter_id'].values
-    else:
-        labels = None
-    
-    view_1hot = pd.get_dummies(df['view_id'], prefix='view').reindex(
-        columns=['view_0', 'view_1', 'view_2', 'view_3'], fill_value=0).astype(float).values
-    
-    if 'signaling' in df.columns:
-        sig_map = {'none': 0, 'low': 1, 'medium': 2, 'high': 3}
-        df['sig_id'] = df['signaling'].map(sig_map).fillna(0)
-    else:
-        df['sig_id'] = 0
-    
-    sig_1hot = pd.get_dummies(df['sig_id'], prefix='sig').reindex(
-        columns=['sig_0', 'sig_1', 'sig_2', 'sig_3'], fill_value=0).astype(float).values
-    
-    # Enhanced feature set: 21 features total
-    features = np.concatenate([
-        # Cyclical time features (6)
-        df[['hour_sin', 'hour_cos', 'minute_sin', 'minute_cos', 'dow_sin', 'dow_cos']].values,
-        # Peak hour indicators (2)
-        df[['is_morning_rush', 'is_evening_rush']].values,
-        # Linear time + segment (3)
-        df[['hour_norm', 'minute_norm', 'seg_id_norm']].values,
-        # View ID (1) + one-hot (4)
-        df[['view_id']].values,
-        view_1hot,
-        # Signaling one-hot (4)
-        sig_1hot
-    ], axis=1).astype('float32')
+# Removed duplicated get_features_and_labels (now imported from chunked_data_loader)
 
-    return features, labels
-
-def identify_blocks(group):
-    group = group.sort_values('time_segment_id')
-    ids = group['time_segment_id'].values
-    is_break = np.zeros(len(ids), dtype=int)
-    is_break[1:] = (ids[1:] != ids[:-1] + 1).astype(int)
-    group['block_id'] = np.cumsum(is_break)
-    return group
-
-def create_raw_sequences(csv_path, val_split=0.2, seq_len=15):
-    """Processes CSV into 3D sequential samples (N, Time, Feat)."""
-    df = pd.read_csv(csv_path)
-    train_X, train_y = [], []
-    val_X, val_y = [], []
-    
-    print(f"Loading {len(df)} rows from {csv_path}...")
-    for label, group in df.groupby('view_label'):
-        group = identify_blocks(group)
-        
-        for b_id, block in group.groupby('block_id'):
-            if len(block) < seq_len + 1: continue
-            
-            # Split block first (Anti-Leakage)
-            n_block = len(block)
-            n_train_rows = int(n_block * (1 - val_split))
-            
-            train_block = block.iloc[:n_train_rows]
-            val_block = block.iloc[n_train_rows:]
-            
-            def make_seqs(sub_block):
-                feats, labels = get_features_and_labels(sub_block)
-                X_w, y_w = [], []
-                for i in range(len(feats) - seq_len):
-                    # KEEP 2D Structure: (15, Features)
-                    X_w.append(feats[i : i + seq_len])
-                    y_w.append(labels[i + seq_len])
-                return X_w, y_w
-            
-            if len(train_block) >= seq_len + 1:
-                tx, ty = make_seqs(train_block)
-                train_X.extend(tx)
-                train_y.extend(ty)
-            
-            if len(val_block) >= seq_len + 1:
-                vx, vy = make_seqs(val_block)
-                val_X.extend(vx)
-                val_y.extend(vy)
-
-    train_y_np, val_y_np = np.array(train_y), np.array(val_y)
-    t_cls, t_cnt = np.unique(train_y_np, return_counts=True)
-    v_cls, v_cnt = np.unique(val_y_np, return_counts=True)
-    print(f"Loaded {len(train_y_np)} train samples with class counts: {dict(zip(t_cls, t_cnt))}")
-    print(f"Loaded {len(val_y_np)} val samples with class counts: {dict(zip(v_cls, v_cnt))}")
-                
-    return np.array(train_X), train_y_np, np.array(val_X), val_y_np
+# Removed old identify_blocks and create_raw_sequences as they are replaced by chunked_data_loader
 
 class ESNClassifier:
     """Echo State Network for Sequence Classification."""
@@ -276,6 +145,8 @@ class ESNClassifier:
         print("ESN Training Complete.")
         
     def predict(self, X):
+        if X.shape[0] == 0:
+            return np.array([])
         N, T, F = X.shape
         X_scaled = self.scaler.transform(X.reshape(-1, F)).reshape(N, T, F)
         states = self._get_states(X_scaled)
@@ -303,10 +174,10 @@ def main():
     print(f"Val data classes:   {dict(zip(v_cls, v_cnt))}")
     print(f"Train Sequence Shape: {X_train.shape}, Val: {X_val.shape}")
     
-    # ESN Params - Optimized for performance
+    # ESN Params - Optimized for performance and memory
     input_dim = X_train.shape[2] 
     esn = ESNClassifier(input_dim=input_dim, 
-                        reservoir_dim=2500,  # Balanced size
+                        reservoir_dim=2500,  # Adjusted for better speed on mobile CPUs
                         spectral_radius=0.95, 
                         leak_rate=0.2, 
                         sparsity=0.05,
@@ -332,17 +203,20 @@ def main():
     print(f"Train Accuracy: {train_acc:.4f}, F1: {train_f1:.4f}")
 
     print("\nEvaluating on Validation Data...")
-    val_pred = esn.predict(X_val)
-    
-    acc = accuracy_score(y_val, val_pred)
-    f1 = f1_score(y_val, val_pred, average='macro')
-    prec = precision_score(y_val, val_pred, average='macro')
-    rec = recall_score(y_val, val_pred, average='macro')
-    
-    print(f"Val Accuracy:  {acc:.4f}")
-    print(f"Val F1 Macro:  {f1:.4f}")
-    print(f"Val Precision: {prec:.4f}")
-    print(f"Val Recall:    {rec:.4f}")
+    if len(y_val) > 0:
+        val_pred = esn.predict(X_val)
+        
+        acc = accuracy_score(y_val, val_pred)
+        f1 = f1_score(y_val, val_pred, average='macro')
+        prec = precision_score(y_val, val_pred, average='macro')
+        rec = recall_score(y_val, val_pred, average='macro')
+        
+        print(f"Val Accuracy:  {acc:.4f}")
+        print(f"Val F1 Macro:  {f1:.4f}")
+        print(f"Val Precision: {prec:.4f}")
+        print(f"Val Recall:    {rec:.4f}")
+    else:
+        print("\nSkipping Validation: No validation samples available after downsampling.")
     
     # Inference
     print("\nStarting Inference...")
@@ -350,28 +224,41 @@ def main():
     test_df = pd.read_csv(test_path)
     prediction_dict = {}
     
+    # Import helper from loader for block identification
+    from chunked_data_loader import identify_blocks
+    
     for label, group in test_df.groupby('view_label'):
         group = identify_blocks(group)
         for b_id, block in group.groupby('block_id'):
-            # This logic needs to match create_raw_sequences utils but for inference
+            # Extract features for this block (original resolution, no downsampling)
             feats, _ = get_features_and_labels(block)
             
-            if len(feats) < 15:
-                history = [feats[0]] * (15 - len(feats)) + list(feats)
+            # Build history directly from raw features
+            if len(feats) < SEQ_LEN:
+                # Pad history with the first feature
+                history = [feats[0]] * (SEQ_LEN - len(feats)) + list(feats)
             else:
-                history = list(feats[-15:])
+                history = list(feats[-SEQ_LEN:])
             
-            start_id = int(round(history[-1][3] * 5000))
+            # Get the starting segment ID from the last known feature
+            start_id = int(round(feats[-1][2] * 5000))
             
+            # Autoregressive prediction: 8 individual predictions, one per target segment
+            temp_history = history.copy()
             for i in range(1, 9):
-                # ESN needs (1, 15, F)
-                current_seq = np.array(history[-15:]).reshape(1, 15, -1)
+                # Build the input sequence from current history
+                current_seq = np.array(temp_history[-SEQ_LEN:]).reshape(1, SEQ_LEN, -1)
+                current_seq = np.clip(current_seq, 0.0, 1.0)
                 
+                # Predict label for this segment
                 p_idx = esn.predict(current_seq)[0]
                 p_label = congestion_map[p_idx]
                 prediction_dict[(label, start_id + i)] = p_label
                 
-                next_feat = np.copy(history[-1])
+                # Update history with a simulated next feature vector
+                next_feat = np.copy(temp_history[-1])
+                
+                # Advance time by 5 minutes (one original segment)
                 curr_h = next_feat[0] * 23.0
                 curr_m = next_feat[1] * 59.0
                 curr_m += 5
@@ -380,8 +267,9 @@ def main():
                     curr_h = (curr_h + 1) % 24
                 next_feat[0] = curr_h / 23.0
                 next_feat[1] = curr_m / 59.0
-                next_feat[3] += 1/5000.0
-                history.append(next_feat)
+                next_feat[2] += 1 / 5000.0  # Increment segment ID
+                
+                temp_history.append(next_feat)
 
     print("Mapping predictions...")
     sample_sub = pd.read_csv(sample_sub_path)

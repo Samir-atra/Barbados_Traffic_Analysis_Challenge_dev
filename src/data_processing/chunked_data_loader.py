@@ -18,7 +18,8 @@ import pandas as pd
 
 # Configuration
 CHUNK_SIZE = 100  # Maximum elements per chunk
-SEQ_LEN = 15      # Default sequence length for sliding windows
+SEQ_LEN = 15      # Sequence length for sliding windows (original resolution)
+DOWNSAMPLE_FACTOR = 1  # No downsampling (kept for compatibility)
 
 
 def get_features_and_labels(df):
@@ -39,17 +40,9 @@ def get_features_and_labels(df):
     minute = df['video_time'].dt.minute
     day_of_week = pd.to_datetime(df['date']).dt.dayofweek
     
-    # Cyclical encoding
-    df['hour_sin'] = np.sin(2 * np.pi * hour / 24.0)
-    df['hour_cos'] = np.cos(2 * np.pi * hour / 24.0)
-    df['minute_sin'] = np.sin(2 * np.pi * minute / 60.0)
-    df['minute_cos'] = np.cos(2 * np.pi * minute / 60.0)
-    df['dow_sin'] = np.sin(2 * np.pi * day_of_week / 7.0)
-    df['dow_cos'] = np.cos(2 * np.pi * day_of_week / 7.0)
+    # Cyclical encoding removed
     
-    # Peak hour indicators
-    df['is_morning_rush'] = ((hour >= 7) & (hour <= 9)).astype(float)
-    df['is_evening_rush'] = ((hour >= 16) & (hour <= 18)).astype(float)
+    # Peak hour indicators removed
     
     # Linear time features
     df['hour_norm'] = hour / 23.0
@@ -88,11 +81,8 @@ def get_features_and_labels(df):
         fill_value=0).astype(float).values
     
     features = np.concatenate([
-        df[['hour_sin', 'hour_cos', 'minute_sin', 'minute_cos', 
-            'dow_sin', 'dow_cos']].values,
-        df[['is_morning_rush', 'is_evening_rush']].values,
         df[['hour_norm', 'minute_norm', 'seg_id_norm']].values,
-        df[['view_id']].values,
+        (df[['view_id']].values / 3.0),
         view_1hot,
         sig_1hot
     ], axis=1).astype('float32')
@@ -226,55 +216,56 @@ def create_raw_sequences_chunked(csv_path, val_split=0.2, seq_len=SEQ_LEN,
     print(f"Loading {len(df)} rows from {csv_path}...")
     print(f"Chunk size: {chunk_size}, Sequence length: {seq_len}")
     
+    # 1. Collect all valid blocks across all views
+    all_blocks_data = []
     for view_label, view_group in df.groupby('view_label'):
         view_group = identify_blocks(view_group)
-        
         for block_id, block in view_group.groupby('block_id'):
-            # Skip blocks too small to create any sequences
-            if len(block) < seq_len + 1:
-                continue
-            
-            # Extract features and labels for the entire block
+            if len(block) >= (SEQ_LEN + 1):
+                all_blocks_data.append(block)
+    
+    # 2. Shuffle blocks globally
+    # Using a fixed seed for reproducibility across runs
+    import random
+    rng = random.Random(42)
+    rng.shuffle(all_blocks_data)
+    
+    # 3. Split blocks into Train and Val sets (Block-level split)
+    n_blocks = len(all_blocks_data)
+    n_train_blocks = int(n_blocks * (1 - val_split))
+    
+    train_blocks = all_blocks_data[:n_train_blocks]
+    val_blocks = all_blocks_data[n_train_blocks:]
+    
+    def process_block_list(blocks, is_train=True):
+        X_out, y_out = [], []
+        chunks_count = 0
+        padded_count = 0
+        
+        for block in blocks:
+            # Extract features/labels (no downsampling)
             features, labels = get_features_and_labels(block)
-            n_block = len(features)
             
-            # Split block into train/val FIRST (before chunking)
-            n_train_rows = int(n_block * (1 - val_split))
+            # Chunk the features directly
+            chunks = chunk_and_pad_block(features, labels, chunk_size)
+            chunks_count += len(chunks)
             
-            train_feats = features[:n_train_rows]
-            train_labs = labels[:n_train_rows] if labels is not None else None
-            val_feats = features[n_train_rows:]
-            val_labs = labels[n_train_rows:] if labels is not None else None
-            
-            # Process training portion
-            if len(train_feats) >= seq_len + 1:
-                # Chunk the training portion
-                train_chunks = chunk_and_pad_block(train_feats, train_labs, chunk_size)
-                total_chunks += len(train_chunks)
-                
-                for chunk_feats, chunk_labs, actual_len in train_chunks:
-                    padded_elements += chunk_size - actual_len
-                    
-                    if actual_len >= seq_len + 1:
-                        train_seqs, train_seq_labs = create_sequences_from_chunk(
-                            chunk_feats, chunk_labs, seq_len, actual_len)
-                        train_X.extend(train_seqs)
-                        train_y.extend(train_seq_labs)
-            
-            # Process validation portion
-            if len(val_feats) >= seq_len + 1:
-                # Chunk the validation portion
-                val_chunks = chunk_and_pad_block(val_feats, val_labs, chunk_size)
-                total_chunks += len(val_chunks)
-                
-                for chunk_feats, chunk_labs, actual_len in val_chunks:
-                    padded_elements += chunk_size - actual_len
-                    
-                    if actual_len >= seq_len + 1:
-                        val_seqs, val_seq_labs = create_sequences_from_chunk(
-                            chunk_feats, chunk_labs, seq_len, actual_len)
-                        val_X.extend(val_seqs)
-                        val_y.extend(val_seq_labs)
+            for chunk_feats, chunk_labs, actual_len in chunks:
+                padded_count += chunk_size - actual_len
+                if actual_len >= seq_len + 1:
+                    seqs, seq_labs = create_sequences_from_chunk(
+                        chunk_feats, chunk_labs, seq_len, actual_len)
+                    X_out.extend(seqs)
+                    y_out.extend(seq_labs)
+        return X_out, y_out, chunks_count, padded_count
+
+    print(f"Distributing {n_blocks} blocks: {n_train_blocks} Train, {n_blocks - n_train_blocks} Val")
+    
+    train_X, train_y, t_chunks, t_padded = process_block_list(train_blocks)
+    val_X, val_y, v_chunks, v_padded = process_block_list(val_blocks)
+    
+    total_chunks = t_chunks + v_chunks
+    padded_elements = t_padded + v_padded
     
     train_y_np = np.array(train_y)
     val_y_np = np.array(val_y)
@@ -288,7 +279,16 @@ def create_raw_sequences_chunked(csv_path, val_split=0.2, seq_len=SEQ_LEN,
     print(f"\nLoaded {len(train_y_np)} train samples: {dict(zip(t_cls, t_cnt))}")
     print(f"Loaded {len(val_y_np)} val samples: {dict(zip(v_cls, v_cnt))}")
     
-    return np.array(train_X), train_y_np, np.array(val_X), val_y_np
+    X_train_np = np.array(train_X)
+    X_val_np = np.array(val_X)
+    
+    # Final check: Ensure features are strictly within [0, 1]
+    # We clip here to handle any potential floating point artifacts or 
+    # slightly out-of-range segment IDs if they exceed 5000
+    X_train_np = np.clip(X_train_np, 0.0, 1.0)
+    X_val_np = np.clip(X_val_np, 0.0, 1.0)
+    
+    return X_train_np, train_y_np, X_val_np, val_y_np
 
 
 
@@ -310,7 +310,10 @@ def analyze_chunked_blocks(csv_path, chunk_size=CHUNK_SIZE):
         view_group = identify_blocks(view_group)
         
         for block_id, block in view_group.groupby('block_id'):
-            block_len = len(block)
+            block_len = len(block) // DOWNSAMPLE_FACTOR
+            if block_len < 1:
+                continue
+                
             n_chunks = (block_len + chunk_size - 1) // chunk_size
             last_chunk_len = block_len % chunk_size
             if last_chunk_len == 0:
@@ -320,7 +323,8 @@ def analyze_chunked_blocks(csv_path, chunk_size=CHUNK_SIZE):
             analysis.append({
                 'view_label': view_label,
                 'block_id': block_id,
-                'original_length': block_len,
+                'original_length': len(block),
+                'downsampled_length': block_len,
                 'n_chunks': n_chunks,
                 'last_chunk_actual_len': last_chunk_len,
                 'padding_needed': padding_needed,
