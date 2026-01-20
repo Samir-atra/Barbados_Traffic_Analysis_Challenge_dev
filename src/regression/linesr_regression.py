@@ -34,6 +34,10 @@ def perform_linear_regression(csv_path: str, output_plot_path: str) -> None:
         'heavy delay': 4
     }
     df['congestion_level'] = df['congestion_exit_rating'].map(congestion_map)
+    
+    # Print class counts
+    class_counts = df['congestion_exit_rating'].value_counts().to_dict()
+    print(f"Data loading - Class Counts: {class_counts}")
 
     # Drop any rows with NaN values in relevant columns
     df = df.dropna(subset=['time_decimal', 'congestion_level'])

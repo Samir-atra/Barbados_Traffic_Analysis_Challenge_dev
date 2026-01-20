@@ -162,14 +162,13 @@ def create_dataset_splits(csv_path, val_split):
                     val_X.append(window)
                     val_y.append(val_labels[i + seq_len])
                 
-    # Convert to arrays and pad with label buffer
-    def pad_X(X_list):
-        X_arr = np.array(X_list)
-        X_padded = np.zeros((X_arr.shape[0], 4 + X_arr.shape[1]), dtype='float32')
-        X_padded[:, 4:] = X_arr
-        return X_padded
-
-    return pad_X(train_X), np.array(train_y), pad_X(val_X), np.array(val_y)
+    train_y_np, val_y_np = np.array(train_y), np.array(val_y)
+    t_cls, t_cnt = np.unique(train_y_np, return_counts=True)
+    v_cls, v_cnt = np.unique(val_y_np, return_counts=True)
+    print(f"Loaded {len(train_y_np)} train samples with class counts: {dict(zip(t_cls, t_cnt))}")
+    print(f"Loaded {len(val_y_np)} val samples with class counts: {dict(zip(v_cls, v_cnt))}")
+    
+    return pad_X(train_X), train_y_np, pad_X(val_X), val_y_np
 
 def categorical_focal_loss(y_true, y_pred, gamma):
     """Computes Categorical Focal Loss using Keras ops.
@@ -743,6 +742,11 @@ def main():
     
     print("Preparing Data...")
     X_train, y_train, X_val, y_val = create_dataset_splits(train_path, val_split=0.2)
+    
+    t_cls, t_cnt = np.unique(y_train, return_counts=True)
+    v_cls, v_cnt = np.unique(y_val, return_counts=True)
+    print(f"Train class distribution: {dict(zip(t_cls, t_cnt))}")
+    print(f"Val class distribution:   {dict(zip(v_cls, v_cnt))}")
     
     # Direct sequential dataset without shuffling or balancing
     train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))

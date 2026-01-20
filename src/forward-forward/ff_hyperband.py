@@ -132,15 +132,13 @@ def create_dataset_splits(csv_path, val_split=0.2):
             val_X.extend(view_X[n_train:])
             val_y.extend(view_y[n_train:])
                 
-    # Convert to arrays and pad with label buffer
-    def pad_X(X_list):
-        X_arr = np.array(X_list)
-        # Pad with 4 zeros for 4 classes
-        X_padded = np.zeros((X_arr.shape[0], 4 + X_arr.shape[1]), dtype='float32')
-        X_padded[:, 4:] = X_arr
-        return X_padded
-
-    return pad_X(train_X), np.array(train_y), pad_X(val_X), np.array(val_y)
+    train_y_np, val_y_np = np.array(train_y), np.array(val_y)
+    t_cls, t_cnt = np.unique(train_y_np, return_counts=True)
+    v_cls, v_cnt = np.unique(val_y_np, return_counts=True)
+    print(f"Loaded {len(train_y_np)} train samples with class counts: {dict(zip(t_cls, t_cnt))}")
+    print(f"Loaded {len(val_y_np)} val samples with class counts: {dict(zip(v_cls, v_cnt))}")
+    
+    return pad_X(train_X), train_y_np, pad_X(val_X), val_y_np
 
 # --- Forward-Forward Classes ---
 
@@ -478,7 +476,11 @@ def main():
     X_train, y_train, X_val, y_val = create_dataset_splits(train_path)
     
     print(f"Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
-    print(f"Input dimension: {X_train.shape[1]}, Num classes: {len(np.unique(y_train))}")
+    t_cls, t_cnt = np.unique(y_train, return_counts=True)
+    v_cls, v_cnt = np.unique(y_val, return_counts=True)
+    print(f"Train class distribution: {dict(zip(t_cls, t_cnt))}")
+    print(f"Val class distribution:   {dict(zip(v_cls, v_cnt))}")
+    print(f"Input dimension: {X_train.shape[1]}, Num classes: {len(t_cls)}")
     
     batch_size = 64
     
