@@ -358,8 +358,14 @@ if __name__ == "__main__":
     y_pred_flat = []
     for i, preds in enumerate(val_preds):
         _, y_seq, _ = val_blocks[i]
-        y_true.extend(y_seq)
-        y_pred_flat.extend(preds)
+        
+        if esn.use_state_avg:
+            # State averaging: 1 prediction per block, use first label
+            y_true.append(y_seq[0])
+            y_pred_flat.extend(preds.flatten())
+        else:
+            y_true.extend(y_seq)
+            y_pred_flat.extend(preds)
     
     y_pred_class = np.round(np.clip(y_pred_flat, 0, 3)).astype(int)
     
