@@ -267,7 +267,7 @@ if __name__ == "__main__":
     # Configuration
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     TRAIN_CSV = os.path.join(BASE_DIR, "demos/Train.csv")
-    TRAIN_BALANCED_CSV = os.path.join(BASE_DIR, "demos/Train_Balanced_3k.csv")
+    TRAIN_BALANCED_CSV = os.path.join(BASE_DIR, "demos/Train.csv")
     
     # Use balanced dataset if available
     DATA_PATH = TRAIN_BALANCED_CSV if os.path.exists(TRAIN_BALANCED_CSV) else TRAIN_CSV
@@ -332,8 +332,8 @@ if __name__ == "__main__":
     
     esn = DeepESN(
         input_dim=input_dim,
-        n_layers=2,
-        res_dim=300,           # Reduced from 500 to prevent overfitting
+        n_layers=5,
+        res_dim=2000,           # Reduced from 500 to prevent overfitting
         spectral_radius=0.9,   # Slightly lower for stability
         leak_rate=0.3,
         ridge_alpha=10.0,      # Higher regularization
@@ -341,8 +341,8 @@ if __name__ == "__main__":
         use_class_weights=True,
         class_weights=None,    # Auto-balanced
         state_noise=0.01,      # Small noise for regularization
-        dropout=0.1,           # 10% dropout on reservoir states
-        use_state_avg=False    # Set True to use sequence-level prediction
+        dropout=0.4,           # 10% dropout on reservoir states
+        use_state_avg=True    # Set True to use sequence-level prediction
     )
     
     esn.fit(train_blocks, compute_metrics=True)
