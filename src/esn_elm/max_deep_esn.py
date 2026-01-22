@@ -126,20 +126,114 @@ class DeepESN(BaseEstimator, ClassifierMixin):
             all_preds.append(preds_seq)
         return all_preds
 
-# --- Simple Unit Test (Mock Data) ---
+# --- Training with Real Data from Chunked Data Loader ---
 if __name__ == "__main__":
-    print("Testing DeepESN Implementation...")
+    import os
+    import sys
+    from sklearn.metrics import classification_report
     
-    # Mock Data: 5 Blocks of length 10, Input dim 128
-    dummy_blocks = []
-    for _ in range(5):
-        X = np.random.rand(10, 128)
-        y = np.random.randint(0, 4, size=(10,))
-        dummy_blocks.append((X, y, None))
+    # Add parent directory to path for imports
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    
+    from data_processing.chunked_data_loader import (
+        create_raw_sequences_chunked,
+        SEQ_LEN
+    )
+    
+    # Configuration
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    TRAIN_CSV = os.path.join(BASE_DIR, "demos/Train.csv")
+    TRAIN_BALANCED_CSV = os.path.join(BASE_DIR, "demos/Train_Balanced_3k.csv")
+    
+    # Use balanced dataset if available
+    DATA_PATH = TRAIN_BALANCED_CSV if os.path.exists(TRAIN_BALANCED_CSV) else TRAIN_CSV
+    
+    def prepare_blocks(X_seqs, y_labels, block_size=50):
+        """Converts sequences to DeepESN block format.
         
-    esn = DeepESN(input_dim=128, n_layers=2, res_dim=100)
-    esn.fit(dummy_blocks)
+        Args:
+            X_seqs: (N, seq_len, n_features) array.
+            y_labels: (N,) array.
+            block_size: Sequences per block.
+            
+        Returns:
+            List of (X_block, y_block, None) tuples.
+        """
+        n_samples = len(X_seqs)
+        seq_len = X_seqs.shape[1]
+        blocks = []
+        
+        for start in range(0, n_samples, block_size):
+            end = min(start + block_size, n_samples)
+            
+            block_X = []
+            block_y = []
+            for i in range(start, end):
+                block_X.append(X_seqs[i])
+                block_y.extend([y_labels[i]] * seq_len)
+            
+            blocks.append((np.vstack(block_X), np.array(block_y), None))
+        
+        return blocks
     
-    preds = esn.predict(dummy_blocks)
-    print(f"Prediction Output Shape (Block 0): {preds[0].shape}")
-    print("Test passed.")
+    print("=" * 60)
+    print("DeepESN Training on Real Traffic Data")
+    print("=" * 60)
+    
+    # Load data
+    print(f"\nLoading data from: {DATA_PATH}")
+    X_train, y_train, X_val, y_val = create_raw_sequences_chunked(DATA_PATH)
+    
+    input_dim = X_train.shape[2]
+    print(f"\nData loaded:")
+    print(f"  X_train: {X_train.shape}, y_train: {y_train.shape}")
+    print(f"  X_val:   {X_val.shape}, y_val:   {y_val.shape}")
+    print(f"  Input dimension: {input_dim}")
+    
+    # Convert to blocks
+    train_blocks = prepare_blocks(X_train, y_train)
+    val_blocks = prepare_blocks(X_val, y_val)
+    print(f"  Train blocks: {len(train_blocks)}, Val blocks: {len(val_blocks)}")
+    
+    # Train DeepESN
+    print("\n" + "=" * 60)
+    print("Training DeepESN")
+    print("=" * 60)
+    
+    esn = DeepESN(
+        input_dim=input_dim,
+        n_layers=2,
+        res_dim=500,
+        spectral_radius=0.95,
+        leak_rate=0.2,
+        ridge_alpha=1.0,
+        random_state=42
+    )
+    
+    esn.fit(train_blocks, compute_metrics=True)
+    
+    # Evaluate on validation set
+    print("\n" + "=" * 60)
+    print("Validation Results")
+    print("=" * 60)
+    
+    val_preds = esn.predict(val_blocks)
+    
+    y_true = []
+    y_pred_flat = []
+    for i, preds in enumerate(val_preds):
+        _, y_seq, _ = val_blocks[i]
+        y_true.extend(y_seq)
+        y_pred_flat.extend(preds)
+    
+    y_pred_class = np.round(np.clip(y_pred_flat, 0, 3)).astype(int)
+    
+    acc = accuracy_score(y_true, y_pred_class)
+    f1 = f1_score(y_true, y_pred_class, average='macro')
+    
+    print(f"\nValidation Accuracy: {acc:.4f}")
+    print(f"Validation F1-Macro: {f1:.4f}")
+    
+    print("\nClassification Report:")
+    labels = ['free flowing', 'light delay', 'moderate delay', 'heavy delay']
+    print(classification_report(y_true, y_pred_class, target_names=labels))
