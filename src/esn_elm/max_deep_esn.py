@@ -4,6 +4,8 @@ This module implements a multi-layer ESN architecture with Ridge regression
 readout and optional class weighting for imbalanced classification.
 """
 
+import gc
+
 import numpy as np
 from sklearn.linear_model import Ridge
 from sklearn.metrics import accuracy_score, f1_score
@@ -201,9 +203,14 @@ class DeepESN(BaseEstimator, ClassifierMixin):
             else:
                 all_targets.append(y_seq)
             
-        # Stack
+        # Stack and clear intermediate lists to save memory
         X_train_res = np.vstack(all_states)
         y_train_flat = np.concatenate(all_targets)
+        
+        # Memory cleanup - delete lists after stacking
+        del all_states, all_targets
+        gc.collect()
+        print(f"  Training data shape: {X_train_res.shape}")
         
         # Compute sample weights if class weighting is enabled
         sample_weights = None
@@ -217,12 +224,21 @@ class DeepESN(BaseEstimator, ClassifierMixin):
         # Fit with sample weights
         self.readout.fit(X_train_res, y_train_flat, sample_weight=sample_weights)
         
+        # Memory cleanup after fitting
+        if sample_weights is not None:
+            del sample_weights
+        
         if compute_metrics:
             y_pred = self.readout.predict(X_train_res)
             y_pred_class = np.round(np.clip(y_pred, 0, 3)).astype(int)
             acc = accuracy_score(y_train_flat, y_pred_class)
             f1 = f1_score(y_train_flat, y_pred_class, average='macro')
             print(f"[TRAIN] DeepESN Accuracy: {acc:.4f} | F1-Macro: {f1:.4f}")
+            del y_pred, y_pred_class
+        
+        # Final cleanup
+        del X_train_res, y_train_flat
+        gc.collect()
             
     def predict(self, blocks):
         """Predict on blocks without regularization."""
