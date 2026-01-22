@@ -1,8 +1,14 @@
+"""Deep Echo State Network (DeepESN) with class weighting support.
+
+This module implements a multi-layer ESN architecture with Ridge regression
+readout and optional class weighting for imbalanced classification.
+"""
 
 import numpy as np
 from sklearn.linear_model import Ridge
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.utils.class_weight import compute_class_weight
 
 class DeepESN(BaseEstimator, ClassifierMixin):
     """
@@ -10,7 +16,26 @@ class DeepESN(BaseEstimator, ClassifierMixin):
     Consists of a stack of reservoir layers. Each layer feeds into the next.
     The final state used for prediction is the concatenation of states from all layers.
     """
-    def __init__(self, input_dim=1280, n_layers=2, res_dim=1000, spectral_radius=0.9, leak_rate=0.2, ridge_alpha=1.0, random_state=42):
+    def __init__(self, input_dim=1280, n_layers=2, res_dim=1000, spectral_radius=0.9,
+                 leak_rate=0.2, ridge_alpha=1.0, random_state=42,
+                 use_class_weights=False, class_weights=None,
+                 state_noise=0.0, dropout=0.0, use_state_avg=False):
+        """Initialize DeepESN with class weighting and regularization.
+        
+        Args:
+            input_dim: Input feature dimension.
+            n_layers: Number of reservoir layers.
+            res_dim: Reservoir dimension per layer.
+            spectral_radius: Spectral radius for reservoir weight scaling.
+            leak_rate: Leaky integration rate.
+            ridge_alpha: Ridge regression regularization (higher = more reg).
+            random_state: Random seed for reproducibility.
+            use_class_weights: If True, compute inverse frequency weights.
+            class_weights: Custom dict {class: weight}. Overrides auto-computed.
+            state_noise: Gaussian noise stddev added to states during training.
+            dropout: Fraction of reservoir states to zero during training.
+            use_state_avg: If True, use mean of states per sequence instead of all.
+        """
         self.input_dim = input_dim
         self.n_layers = n_layers
         self.res_dim = res_dim
@@ -18,6 +43,12 @@ class DeepESN(BaseEstimator, ClassifierMixin):
         self.leak_rate = leak_rate
         self.ridge_alpha = ridge_alpha
         self.random_state = random_state
+        self.use_class_weights = use_class_weights
+        self.class_weights = class_weights
+        self.state_noise = state_noise
+        self.dropout = dropout
+        self.use_state_avg = use_state_avg
+        self._training = False  # Flag to apply regularization only during fit
         
         # Initialize Architecture
         self.layers = [] # List of dicts {'W_in', 'W_res'}
@@ -53,18 +84,22 @@ class DeepESN(BaseEstimator, ClassifierMixin):
             
         self.readout = Ridge(alpha=self.ridge_alpha)
         
-    def get_states_sequence(self, input_seq):
-        """
-        Processes a sequence (T, input_dim) through the Deep ESN stack.
-        Returns: (T, n_layers * res_dim) - Concatenated states of all layers
+    def get_states_sequence(self, input_seq, apply_regularization=False):
+        """Processes a sequence through the Deep ESN stack.
+        
+        Args:
+            input_seq: (T, input_dim) input sequence.
+            apply_regularization: If True, apply noise and dropout (training).
+            
+        Returns:
+            (T, n_layers * res_dim) concatenated states if not use_state_avg,
+            else (1, n_layers * res_dim) averaged state.
         """
         T = input_seq.shape[0]
+        rng = np.random.RandomState(None)  # Different noise each call
         
-        # We need to store full sequence of states for each layer to feed to the next
-        # layer_states: prediction input for next layer
-        prev_layer_seq = input_seq # Start with actual input
-        
-        all_layers_collected_states = [] # To be concatenated for readout
+        prev_layer_seq = input_seq
+        all_layers_collected_states = []
         
         for i, layer in enumerate(self.layers):
             W_in = layer['W_in']
@@ -76,40 +111,111 @@ class DeepESN(BaseEstimator, ClassifierMixin):
             for t in range(T):
                 u = prev_layer_seq[t]
                 
-                # Standard ESN Equestion: x(t) = (1-a)x(t-1) + a*tanh(Win*u + Wres*x(t-1))
+                # Standard ESN: x(t) = (1-a)x(t-1) + a*tanh(Win*u + Wres*x(t-1))
                 pre = np.dot(W_in, u) + np.dot(W_res, x)
                 update = np.tanh(pre)
                 x = (1 - self.leak_rate) * x + self.leak_rate * update
                 
+                # Apply regularization during training
+                if apply_regularization:
+                    # State noise
+                    if self.state_noise > 0:
+                        x = x + rng.normal(0, self.state_noise, x.shape)
+                    # Dropout
+                    if self.dropout > 0:
+                        mask = rng.rand(len(x)) > self.dropout
+                        x = x * mask / (1 - self.dropout)  # Inverted dropout
+                
                 current_layer_states[t] = x
             
             all_layers_collected_states.append(current_layer_states)
-            prev_layer_seq = current_layer_states # Output of this layer is input to next
+            prev_layer_seq = current_layer_states
             
         # Concatenate all layers: (T, n_layers * res_dim)
         final_states = np.hstack(all_layers_collected_states)
+        
+        # Optional: average states for regularization (reduces overfitting)
+        if self.use_state_avg:
+            return final_states.mean(axis=0, keepdims=True)
+        
         return final_states
 
-    def fit(self, blocks, compute_metrics=True):
+    def _compute_sample_weights(self, y):
+        """Compute per-sample weights based on class weights.
+        
+        Args:
+            y: Target labels array.
+            
+        Returns:
+            Array of sample weights.
         """
-        Trains the execution readout on sequential blocks.
-        blocks: List of (X_seq, y_seq, ...)
+        classes = np.array([0, 1, 2, 3])
+        
+        if self.class_weights is not None:
+            # Use custom class weights
+            weights_dict = self.class_weights
+            print(f"  Using custom class weights: {weights_dict}")
+        else:
+            # Compute balanced weights (inverse frequency)
+            unique_in_y = np.unique(y)
+            computed_weights = compute_class_weight(
+                class_weight='balanced',
+                classes=unique_in_y,
+                y=y
+            )
+            weights_dict = dict(zip(unique_in_y, computed_weights))
+            
+            # Fill missing classes with weight 1.0
+            for c in classes:
+                if c not in weights_dict:
+                    weights_dict[c] = 1.0
+                    
+            print(f"  Auto-computed class weights: {weights_dict}")
+        
+        # Map to sample weights
+        sample_weights = np.array([weights_dict.get(int(label), 1.0) for label in y])
+        return sample_weights
+    
+    def fit(self, blocks, compute_metrics=True):
+        """Trains the readout on sequential blocks with optional class weighting.
+        
+        Args:
+            blocks: List of (X_seq, y_seq, ...) tuples.
+            compute_metrics: If True, print training accuracy and F1.
         """
         all_states = []
         all_targets = []
         
         print(f"DeepESN: Training on {len(blocks)} blocks (Layers={self.n_layers}, ResDim={self.res_dim})...")
+        print(f"  Regularization: noise={self.state_noise}, dropout={self.dropout}, state_avg={self.use_state_avg}")
+        print(f"  Class weighting: {self.use_class_weights}")
         
         for idx, (X_seq, y_seq, _) in enumerate(blocks):
-            states_seq = self.get_states_sequence(X_seq)
+            # Apply regularization during training
+            states_seq = self.get_states_sequence(X_seq, apply_regularization=True)
             all_states.append(states_seq)
-            all_targets.append(y_seq)
+            
+            # Handle state averaging (1 state per sequence)
+            if self.use_state_avg:
+                all_targets.append([y_seq[0]])  # Single label per sequence
+            else:
+                all_targets.append(y_seq)
             
         # Stack
         X_train_res = np.vstack(all_states)
         y_train_flat = np.concatenate(all_targets)
         
-        self.readout.fit(X_train_res, y_train_flat)
+        # Compute sample weights if class weighting is enabled
+        sample_weights = None
+        if self.use_class_weights:
+            sample_weights = self._compute_sample_weights(y_train_flat)
+            
+            # Log class distribution
+            unique, counts = np.unique(y_train_flat, return_counts=True)
+            print(f"  Class distribution: {dict(zip(unique, counts))}")
+        
+        # Fit with sample weights
+        self.readout.fit(X_train_res, y_train_flat, sample_weight=sample_weights)
         
         if compute_metrics:
             y_pred = self.readout.predict(X_train_res)
@@ -119,9 +225,11 @@ class DeepESN(BaseEstimator, ClassifierMixin):
             print(f"[TRAIN] DeepESN Accuracy: {acc:.4f} | F1-Macro: {f1:.4f}")
             
     def predict(self, blocks):
+        """Predict on blocks without regularization."""
         all_preds = []
         for X_seq, _, _ in blocks:
-            states_seq = self.get_states_sequence(X_seq)
+            # No regularization during inference
+            states_seq = self.get_states_sequence(X_seq, apply_regularization=False)
             preds_seq = self.readout.predict(states_seq)
             all_preds.append(preds_seq)
         return all_preds
@@ -200,14 +308,25 @@ if __name__ == "__main__":
     print("Training DeepESN")
     print("=" * 60)
     
+    # Regularization settings to combat overfitting:
+    # - state_noise: adds Gaussian noise to reservoir states
+    # - dropout: randomly zeros reservoir activations
+    # - ridge_alpha: L2 regularization on readout (higher = more reg)
+    # - use_state_avg: average states instead of using all timesteps
+    
     esn = DeepESN(
         input_dim=input_dim,
         n_layers=2,
-        res_dim=500,
-        spectral_radius=0.95,
-        leak_rate=0.2,
-        ridge_alpha=1.0,
-        random_state=42
+        res_dim=300,           # Reduced from 500 to prevent overfitting
+        spectral_radius=0.9,   # Slightly lower for stability
+        leak_rate=0.3,
+        ridge_alpha=10.0,      # Higher regularization
+        random_state=42,
+        use_class_weights=True,
+        class_weights=None,    # Auto-balanced
+        state_noise=0.01,      # Small noise for regularization
+        dropout=0.1,           # 10% dropout on reservoir states
+        use_state_avg=False    # Set True to use sequence-level prediction
     )
     
     esn.fit(train_blocks, compute_metrics=True)
