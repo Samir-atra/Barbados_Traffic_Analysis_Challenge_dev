@@ -237,3 +237,92 @@ if __name__ == "__main__":
     print("\nClassification Report:")
     labels = ['free flowing', 'light delay', 'moderate delay', 'heavy delay']
     print(classification_report(y_true, y_pred_class, target_names=labels))
+    
+    # ============================================================
+    # SUBMISSION FILE GENERATION
+    # ============================================================
+    print("\n" + "=" * 60)
+    print("Generating Submission File")
+    print("=" * 60)
+    
+    TEST_CSV = os.path.join(BASE_DIR, "demos/TestInputSegments.csv")
+    SAMPLE_SUB = os.path.join(BASE_DIR, "demos/SampleSubmission.csv")
+    OUTPUT_CSV = os.path.join(BASE_DIR, "demos/submission.csv")
+    
+    if not os.path.exists(TEST_CSV):
+        print(f"Test file not found: {TEST_CSV}")
+    else:
+        import pandas as pd
+        from data_processing.chunked_data_loader import get_features_and_labels
+        
+        # Load test data and sample submission
+        test_df = pd.read_csv(TEST_CSV)
+        sample_sub = pd.read_csv(SAMPLE_SUB)
+        
+        print(f"Test data: {len(test_df)} rows")
+        print(f"Sample submission: {len(sample_sub)} IDs to predict")
+        
+        # Extract features from test data (no labels)
+        test_features, _ = get_features_and_labels(test_df)
+        
+        # Create test blocks - group by cycle_phase for sequential processing
+        congestion_map_reverse = {0: 'free flowing', 1: 'light delay', 
+                                   2: 'moderate delay', 3: 'heavy delay'}
+        
+        # Build a mapping from segment ID to prediction
+        predictions_map = {}
+        
+        # Process test data by groups (cycle_phase)
+        for cycle_phase, group in test_df.groupby('cycle_phase'):
+            group = group.sort_values('time_segment_id')
+            indices = group.index.tolist()
+            
+            if len(indices) < SEQ_LEN + 1:
+                # Too short for sequence, use last available features
+                group_features = test_features[indices]
+                if len(group_features) > 0:
+                    # Pad to minimum sequence length
+                    while len(group_features) < SEQ_LEN:
+                        group_features = np.vstack([group_features, group_features[-1:]])
+            else:
+                group_features = test_features[indices]
+            
+            # Process through ESN
+            if len(group_features) >= SEQ_LEN:
+                states = esn.get_states_sequence(group_features)
+                preds = esn.readout.predict(states)
+                pred_classes = np.round(np.clip(preds, 0, 3)).astype(int)
+                
+                # Map predictions back to segment IDs
+                for j, idx in enumerate(indices):
+                    if j < len(pred_classes):
+                        row = test_df.loc[idx]
+                        pred_label = congestion_map_reverse[pred_classes[j]]
+                        
+                        # Store predictions for both enter and exit
+                        predictions_map[row['ID_enter']] = pred_label
+                        predictions_map[row['ID_exit']] = pred_label
+        
+        # Create submission dataframe
+        submission_rows = []
+        for _, row in sample_sub.iterrows():
+            seg_id = row['ID']
+            if seg_id in predictions_map:
+                pred = predictions_map[seg_id]
+            else:
+                # Default prediction if not found
+                pred = 'free flowing'
+            
+            submission_rows.append({
+                'ID': seg_id,
+                'Target': pred,
+                'Target_Accuracy': pred
+            })
+        
+        submission_df = pd.DataFrame(submission_rows)
+        submission_df.to_csv(OUTPUT_CSV, index=False)
+        
+        print(f"\nSubmission file saved to: {OUTPUT_CSV}")
+        print(f"Total predictions: {len(submission_df)}")
+        print("\nPrediction distribution:")
+        print(submission_df['Target'].value_counts())
