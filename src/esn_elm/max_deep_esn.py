@@ -332,8 +332,8 @@ if __name__ == "__main__":
     
     esn = DeepESN(
         input_dim=input_dim,
-        n_layers=5,
-        res_dim=2000,           # Reduced from 500 to prevent overfitting
+        n_layers=8,
+        res_dim=8000,           # Reduced from 500 to prevent overfitting
         spectral_radius=0.9,   # Slightly lower for stability
         leak_rate=0.3,
         ridge_alpha=10.0,      # Higher regularization
@@ -341,7 +341,7 @@ if __name__ == "__main__":
         use_class_weights=True,
         class_weights=None,    # Auto-balanced
         state_noise=0.01,      # Small noise for regularization
-        dropout=0.4,           # 10% dropout on reservoir states
+        dropout=0.5,           # 10% dropout on reservoir states
         use_state_avg=True    # Set True to use sequence-level prediction
     )
     
