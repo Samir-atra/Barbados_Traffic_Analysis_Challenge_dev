@@ -5,12 +5,25 @@ readout and optional class weighting for imbalanced classification.
 """
 
 import gc
-
+import os
+import random
 import numpy as np
 from sklearn.linear_model import Ridge
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.class_weight import compute_class_weight
+
+def set_seed(seed=42):
+    """Sets random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    try:
+        import tensorflow as tf
+        tf.random.set_seed(seed)
+    except ImportError:
+        pass
+    print(f"Random seed set to {seed}")
 
 class DeepESN(BaseEstimator, ClassifierMixin):
     """
@@ -54,7 +67,7 @@ class DeepESN(BaseEstimator, ClassifierMixin):
         
         # Initialize Architecture
         self.layers = [] # List of dicts {'W_in', 'W_res'}
-        rng = np.random.RandomState(self.random_state)
+        self.rng = np.random.RandomState(self.random_state)
         
         for i in range(n_layers):
             # Input dimension for layer i: 
@@ -63,11 +76,11 @@ class DeepESN(BaseEstimator, ClassifierMixin):
             curr_input_dim = input_dim if i == 0 else res_dim
             
             # Input weights
-            W_in = rng.uniform(-1, 1, (res_dim, curr_input_dim))
+            W_in = self.rng.uniform(-1, 1, (res_dim, curr_input_dim))
             
             # Reservoir weights (Sparse)
-            W_res = rng.uniform(-1, 1, (res_dim, res_dim))
-            mask = rng.rand(res_dim, res_dim) > 0.95
+            W_res = self.rng.uniform(-1, 1, (res_dim, res_dim))
+            mask = self.rng.rand(res_dim, res_dim) > 0.95
             W_res[mask] = 0
             
             # Spectral Radius Scaling
@@ -84,7 +97,7 @@ class DeepESN(BaseEstimator, ClassifierMixin):
                 'W_res': W_res
             })
             
-        self.readout = Ridge(alpha=self.ridge_alpha)
+        self.readout = Ridge(alpha=self.ridge_alpha, random_state=self.random_state)
         
     def get_states_sequence(self, input_seq, apply_regularization=False):
         """Processes a sequence through the Deep ESN stack.
@@ -98,7 +111,8 @@ class DeepESN(BaseEstimator, ClassifierMixin):
             else (1, n_layers * res_dim) averaged state.
         """
         T = input_seq.shape[0]
-        rng = np.random.RandomState(None)  # Different noise each call
+        # Use simple rng for noise if not doing strict reproducible step-by-step 
+        # but here we want strict reproducibility so we use self.rng
         
         prev_layer_seq = input_seq
         all_layers_collected_states = []
@@ -122,10 +136,10 @@ class DeepESN(BaseEstimator, ClassifierMixin):
                 if apply_regularization:
                     # State noise
                     if self.state_noise > 0:
-                        x = x + rng.normal(0, self.state_noise, x.shape)
+                        x = x + self.rng.normal(0, self.state_noise, x.shape)
                     # Dropout
                     if self.dropout > 0:
-                        mask = rng.rand(len(x)) > self.dropout
+                        mask = self.rng.rand(len(x)) > self.dropout
                         x = x * mask / (1 - self.dropout)  # Inverted dropout
                 
                 current_layer_states[t] = x
@@ -256,6 +270,9 @@ if __name__ == "__main__":
     import sys
     from sklearn.metrics import classification_report
     
+    # Set seed for global reproducibility
+    set_seed(42)
+
     # Add parent directory to path for imports
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     
@@ -332,8 +349,8 @@ if __name__ == "__main__":
     
     esn = DeepESN(
         input_dim=input_dim,
-        n_layers=8,
-        res_dim=8000,           # Reduced from 500 to prevent overfitting
+        n_layers=2,
+        res_dim=1000,           # Reduced from 500 to prevent overfitting
         spectral_radius=0.9,   # Slightly lower for stability
         leak_rate=0.3,
         ridge_alpha=10.0,      # Higher regularization
