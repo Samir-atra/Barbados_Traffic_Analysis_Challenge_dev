@@ -246,7 +246,7 @@ class DeepESN(BaseEstimator, ClassifierMixin):
             y_pred = self.readout.predict(X_train_res)
             y_pred_class = np.round(np.clip(y_pred, 0, 3)).astype(int)
             acc = accuracy_score(y_train_flat, y_pred_class)
-            f1 = f1_score(y_train_flat, y_pred_class, average='macro')
+            f1 = f1_score(y_train_flat, y_pred_class, average='macro', zero_division=0)
             print(f"[TRAIN] DeepESN Accuracy: {acc:.4f} | F1-Macro: {f1:.4f}")
             del y_pred, y_pred_class
         
@@ -387,14 +387,14 @@ if __name__ == "__main__":
     y_pred_class = np.round(np.clip(y_pred_flat, 0, 3)).astype(int)
     
     acc = accuracy_score(y_true, y_pred_class)
-    f1 = f1_score(y_true, y_pred_class, average='macro')
+    f1 = f1_score(y_true, y_pred_class, average='macro', zero_division=0)
     
     print(f"\nValidation Accuracy: {acc:.4f}")
     print(f"Validation F1-Macro: {f1:.4f}")
     
     print("\nClassification Report:")
     labels = ['free flowing', 'light delay', 'moderate delay', 'heavy delay']
-    print(classification_report(y_true, y_pred_class, target_names=labels))
+    print(classification_report(y_true, y_pred_class, target_names=labels, zero_division=0))
     
     # ============================================================
     # SUBMISSION FILE GENERATION
