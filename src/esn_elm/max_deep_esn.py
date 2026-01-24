@@ -400,7 +400,7 @@ if __name__ == "__main__":
     # SUBMISSION FILE GENERATION
     # ============================================================
     print("\n" + "=" * 60)
-    print("Generating Submission File")
+    print("Generating Submission File (Autoregressive Inference)")
     print("=" * 60)
     
     TEST_CSV = os.path.join(BASE_DIR, "demos/TestInputSegments.csv")
@@ -411,7 +411,7 @@ if __name__ == "__main__":
         print(f"Test file not found: {TEST_CSV}")
     else:
         import pandas as pd
-        from data_processing.chunked_data_loader import get_features_and_labels
+        from data_processing.chunked_data_loader import get_features_and_labels, identify_blocks
         
         # Load test data and sample submission
         test_df = pd.read_csv(TEST_CSV)
@@ -420,63 +420,122 @@ if __name__ == "__main__":
         print(f"Test data: {len(test_df)} rows")
         print(f"Sample submission: {len(sample_sub)} IDs to predict")
         
-        # Extract features from test data (no labels)
-        test_features, _ = get_features_and_labels(test_df)
+        congestion_map = {0: 'free flowing', 1: 'light delay', 
+                          2: 'moderate delay', 3: 'heavy delay'}
         
-        # Create test blocks - group by cycle_phase for sequential processing
-        congestion_map_reverse = {0: 'free flowing', 1: 'light delay', 
-                                   2: 'moderate delay', 3: 'heavy delay'}
+        # Dictionary to store predictions: Key=(view_label, segment_id), Value=Prediction
+        prediction_dict = {}
         
-        # Build a mapping from segment ID to prediction
-        predictions_map = {}
+        print("Starting Autoregressive Inference...")
         
-        # Process test data by groups (cycle_phase)
-        for cycle_phase, group in test_df.groupby('cycle_phase'):
-            group = group.sort_values('time_segment_id')
-            indices = group.index.tolist()
+        # Process by view_label (Location)
+        for view_label, group in test_df.groupby('view_label'):
+            # Identify continuous blocks within this view
+            group = identify_blocks(group)
             
-            if len(indices) < SEQ_LEN + 1:
-                # Too short for sequence, use last available features
-                group_features = test_features[indices]
-                if len(group_features) > 0:
-                    # Pad to minimum sequence length
-                    while len(group_features) < SEQ_LEN:
-                        group_features = np.vstack([group_features, group_features[-1:]])
-            else:
-                group_features = test_features[indices]
-            
-            # Process through ESN
-            if len(group_features) >= SEQ_LEN:
-                states = esn.get_states_sequence(group_features)
-                preds = esn.readout.predict(states)
-                pred_classes = np.round(np.clip(preds, 0, 3)).astype(int)
+            for b_id, block in group.groupby('block_id'):
+                # Extract features for this block
+                feats, _ = get_features_and_labels(block)
                 
-                # Map predictions back to segment IDs
-                for j, idx in enumerate(indices):
-                    if j < len(pred_classes):
-                        row = test_df.loc[idx]
-                        pred_label = congestion_map_reverse[pred_classes[j]]
+                # Build history buffer
+                if len(feats) < SEQ_LEN:
+                    # Pad history with the first feature if chunk is too short
+                    pad_len = SEQ_LEN - len(feats)
+                    padding = np.tile(feats[0], (pad_len, 1))
+                    history = np.vstack([padding, feats]).tolist()
+                else:
+                    # Take the last SEQ_LEN frames
+                    history = feats[-SEQ_LEN:].tolist()
+                
+                # Get the starting segment ID from the last known feature (feature idx 2 is seg_id_norm)
+                # seg_id_norm = time_segment_id / 5000.0
+                start_id = int(round(history[-1][2] * 5000.0))
+                
+                # Autoregressive prediction: 8 steps into the future (approx 40 mins)
+                temp_history = history.copy()
+                
+                for i in range(1, 9):
+                    # Build input sequence (Last SEQ_LEN steps)
+                    current_seq = np.array(temp_history[-SEQ_LEN:]).reshape(SEQ_LEN, -1)
+                    
+                    # DeepESN State Generation
+                    # get_states_sequence expects (T, F) and returns (1, dim) if averaged
+                    states = esn.get_states_sequence(current_seq, apply_regularization=False)
+                    
+                    # Predict using Ridge readout
+                    preds = esn.readout.predict(states)
+                    
+                    # Get class index (Regression to classification)
+                    pred_idx = int(np.round(np.clip(preds[0], 0, 3)))
+                    pred_label = congestion_map[pred_idx]
+                    
+                    # Store prediction for this future segment
+                    target_seg_id = start_id + i
+                    prediction_dict[(view_label, target_seg_id)] = pred_label
+                    
+                    # Update history for next step simulation
+                    next_feat = np.copy(temp_history[-1])
+                    
+                    # Advance time by 5 minutes
+                    # Feature 0: hour_norm (hour / 23.0)
+                    # Feature 1: minute_norm (minute / 59.0)
+                    curr_h = next_feat[0] * 23.0
+                    curr_m = next_feat[1] * 59.0
+                    
+                    curr_m += 5
+                    if curr_m > 59:
+                        curr_m -= 60
+                        curr_h += 1
+                    if curr_h > 23:
+                        curr_h = 0 # Approximate day wrap
                         
-                        # Store predictions for both enter and exit
-                        predictions_map[row['ID_enter']] = pred_label
-                        predictions_map[row['ID_exit']] = pred_label
+                    next_feat[0] = curr_h / 23.0
+                    next_feat[1] = curr_m / 59.0
+                    
+                    # Increment segment ID
+                    next_feat[2] += 1.0 / 5000.0
+                    
+                    # Append simulated feature to history
+                    temp_history.append(next_feat)
+
+        print(f"Generated {len(prediction_dict)} predictions.")
         
-        # Create submission dataframe
+        # Map predictions to submission file
         submission_rows = []
+        missing_count = 0
+        
         for _, row in sample_sub.iterrows():
-            seg_id = row['ID']
-            if seg_id in predictions_map:
-                pred = predictions_map[seg_id]
-            else:
-                # Default prediction if not found
+            # ID format example: time_segment_129_Norman Niles #1_congestion_enter_rating
+            parts = row['ID'].split('_')
+            
+            try:
+                # Part 2 is the ID (e.g., '129')
+                tid = int(parts[2])
+                
+                # Part 3 is the View Label (e.g., 'Norman Niles #1')
+                # Note: This relies on the ID format being consistent
+                vlabel = parts[3]
+                
+                key = (vlabel, tid)
+                if key in prediction_dict:
+                    pred = prediction_dict[key]
+                else:
+                    # Fallback if prediction is missing (e.g., ID out of range of 8 steps)
+                    pred = 'free flowing'
+                    missing_count += 1
+            except (ValueError, IndexError):
                 pred = 'free flowing'
+                missing_count += 1
             
             submission_rows.append({
-                'ID': seg_id,
+                'ID': row['ID'],
                 'Target': pred,
                 'Target_Accuracy': pred
             })
         
+        if missing_count > 0:
+            print(f"Warning: {missing_count} IDs in submission were not found in generated predictions.")
+            
         submission_df = pd.DataFrame(submission_rows)
         submission_df.to_csv(OUTPUT_CSV, index=False)
         
