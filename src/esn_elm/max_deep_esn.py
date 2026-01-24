@@ -349,9 +349,9 @@ if __name__ == "__main__":
     
     esn = DeepESN(
         input_dim=input_dim,
-        n_layers=2,
-        res_dim=1000,           # Reduced from 500 to prevent overfitting
-        spectral_radius=0.9,   # Slightly lower for stability
+        n_layers=15,
+        res_dim=3000,           # Reduced from 500 to prevent overfitting
+        spectral_radius=0.8,   # Slightly lower for stability
         leak_rate=0.3,
         ridge_alpha=10.0,      # Higher regularization
         random_state=42,
