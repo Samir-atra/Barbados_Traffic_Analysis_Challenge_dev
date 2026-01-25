@@ -289,7 +289,7 @@ if __name__ == "__main__":
     # Use balanced dataset if available
     DATA_PATH = TRAIN_BALANCED_CSV if os.path.exists(TRAIN_BALANCED_CSV) else TRAIN_CSV
     
-    def prepare_blocks(X_seqs, y_labels, block_size=50):
+    def prepare_blocks(X_seqs, y_labels, block_size=14):
         """Converts sequences to DeepESN block format.
         
         Args:
@@ -349,15 +349,15 @@ if __name__ == "__main__":
     
     esn = DeepESN(
         input_dim=input_dim,
-        n_layers=15,
-        res_dim=3000,           # Reduced from 500 to prevent overfitting
+        n_layers=4,
+        res_dim=1000,           # Reduced from 500 to prevent overfitting
         spectral_radius=0.8,   # Slightly lower for stability
         leak_rate=0.3,
-        ridge_alpha=10.0,      # Higher regularization
+        ridge_alpha=15.0,      # Higher regularization
         random_state=42,
         use_class_weights=True,
         class_weights=None,    # Auto-balanced
-        state_noise=0.01,      # Small noise for regularization
+        state_noise=0.15,      # Small noise for regularization
         dropout=0.5,           # 10% dropout on reservoir states
         use_state_avg=True    # Set True to use sequence-level prediction
     )
