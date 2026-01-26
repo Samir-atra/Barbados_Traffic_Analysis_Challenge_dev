@@ -1,70 +1,81 @@
 # Barbados Traffic Analysis Challenge 🚗🚦
 
-This repository contains the implementation of a **Forward-Forward (FF)** neural network architecture designed for sequential traffic congestion prediction in the [Barbados Traffic Analysis Challenge](https://zindi.africa/competitions/barbados-traffic-analysis-challenge).
+This repository contains the solution for the [Barbados Traffic Analysis Challenge](https://zindi.africa/competitions/barbados-traffic-analysis-challenge). The goal is to predict traffic congestion levels (4 classes) for the next 8 time segments based on historical traffic patterns and signaling states.
 
-The objective is to predict the congestion level (4 classes) for the next 8 time segments based on historical traffic patterns and signaling states.
+**Key Constraint**: The competition requires that the training and inference models **must not use backpropagation**. This repository explores alternative learning paradigms like **Echo State Networks (ESN)**, **Extreme Learning Machines (ELM)**, and **Forward-Forward (FF)** algorithms.
 
 ## 🚀 Key Features
 
-- **Forward-Forward Algorithm**: Implements Hinton's FF architecture, replacing traditional Backpropagation with local "goodness" maximization.
-- **Temporal Context**: Leverages a **15-step sliding window** (195 features) to capture short-term traffic trends and periodicities.
-- **Robust Training**:
-  - **Focal Loss**: Specifically tuned to handle the severe class imbalance in traffic data.
-  - **Cosine Decay**: Implements a smooth learning rate schedule calibrated for local layer updates.
-  - **Exponential Moving Average (EMA)**: Ensures weight stability across training iterations.
-- **Kaggle Optimized**: Includes a dedicated Hyperband tuning kernel optimized for Kaggle GPU environments.
+*   **Deep Echo State Network (DeepESN)**: A stacked reservoir computing architecture that captures temporal dynamics without backpropagation.
+    *   Optimized hyperparameters: Spectral Radius, Leak Rate, Reservoir Dimension.
+    *   Forward-pass only training using Ridge Regression.
+*   **Extreme Learning Machine (ELM)**: Single-hidden layer feedforward networks with randomized weights and analytical output weight calculation.
+*   **Forward-Forward Algorithm**: An implementation of Hinton's local goodness maximization (archived).
+*   **Video Analysis**: Preliminary exploration of traffic density estimation using computer vision (MediaPipe, MobileNet) to correlate video feeds with congestion labels.
+*   **Robust Data Pipeline**:
+    *   Handling sequence length variations with chunking and block processing.
+    *   Focal Loss Integration (for applicable components).
+    *   Signaling feature engineering (None, Low, Medium, High).
 
 ## 📁 Repository Structure
 
 ```tree
 .
-├── analytics/              # Visualization of training metrics (Loss, F1, Acc)
-├── demos/                  # Dataset files (Train.csv, TestInputSegments.csv)
-├── docs/                   # Experimentation notes and hyperparameter logs
-├── kaggle_kernel/          # Automated tuning script and metadata for Kaggle push
-│   └── ff_hyperband_kernel.py
-├── submissions/            # Generated submission.csv files
-└── src/
-    └── forward-forward/
-        └── ff_restructured.py  # Primary training and autoregressive inference script
+├── analytics/              # Visualization of training metrics
+├── datasets/               # Raw and processed datasets
+├── docs/                   # Experimentation notes and logs
+├── src/
+│   ├── esn_elm/            # Active: DeepESN and ELM implementations
+│   │   ├── max_deep_esn.py # Main DeepESN training and inference script
+│   │   ├── esn_traffic.py  # ESN baseline
+│   │   └── run_deep_esn_tuning.py # Hyperparameter tuning for DeepESN
+│   ├── forward-forward/    # Archived: FF algorithm implementation
+│   ├── video_pipeline/     # Video processing and object counting experiments
+│   └── data_processing/    # Data loading and utility scripts
+├── submissions/            # Generated submission files
+└── tests/                  # Unit tests
 ```
 
 ## 🧠 Methodology
 
-### Forward-Forward (FF) Architecture
-Unlike standard neural networks that use a backward pass to distribute errors, this model uses a **Local Goodness** objective. Each layer independently learns to:
-1. **Maximize goodness** for "Positive" data (Real features + Correct label overlay).
-2. **Minimize goodness** for "Negative" data (Real features + Incorrect label overlay).
+### Deep Echo State Network (DeepESN)
+The core model is a DeepESN, which consists of a stack of non-linear reservoir layers.
+1.  **Input**: Sequential traffic data (features + mapped targets).
+2.  **Reservoir**: Multiple layers of recurrently connected neurons with fixed, randomized weights. Each layer feeds into the next, creating a deep temporal representation.
+3.  **Readout**: A linear readout layer trained via **Ridge Regression** (closed-form solution) to map the reservoir states to the target traffic classes.
+4.  **Inference**: Autoregressive forecasting where predictions are fed back to generate the full 8-step horizon.
 
-### Data Pipeline
-- **Input Dimensions**: 199 (15 time steps × 13 features + 4-dim label buffer).
-- **Label Buffer**: The label is one-hot encoded and overlaid on the first 4 dimensions of the input vector, allowing the model to distinguish between different "hypothesized" states.
-- **Inference**: Uses an **Autoregressive Forecaster** where the predicted state $t+1$ is recycled back into the 15-step history window to predict $t+2$ through $t+8$.
+### Video Analysis (Exploratory)
+We explored using object detection (efficientnet, various CNNs) to count vehicles in video feeds to ground-truth the "Traffic Density" labels. While resource-intensive, this provided insights into the correlation between visual traffic flow and the provided labels.
 
 ## 🛠️ Usage
 
 ### Prerequisites
-- Python 3.10+
-- TensorFlow / Keras 3.x
-- Pandas, NumPy, Matplotlib
+*   Python 3.10+
+*   TensorFlow / Keras 3.x (for data handling/utilities)
+*   Polars (for fast tabular data loading)
+*   Scikit-learn, Numpy, Matplotlib
 
-### Local Training
-To train the model on your local machine using the current best hyperparameters:
+### Running Default Training (DeepESN)
+To train the DeepESN model using the current best hyperparameters:
+
 ```bash
-python src/forward-forward/ff_restructured.py
+python src/esn_elm/max_deep_esn.py
 ```
 
-### Hyperparameter Tuning (Kaggle)
-The tuning script is designed to run in a Kaggle environment via the `kaggle` CLI:
+### Hyperparameter Tuning
+To run a sweep of hyperparameters (Spectral Radius, Leak Rate, Layers, etc.):
+
 ```bash
-cd kaggle_kernel
-kaggle kernels push
+python src/esn_elm/run_deep_esn_tuning.py
 ```
 
-## 📊 Current Metrics
-Based on the latest runs with a sequence length of 15:
-- **Macro F1 Score**: ~0.37 (Targeting minority classes: Light, Moderate, Heavy Delay).
-- **Inference Horizon**: 8 sequential segments (Approx. 40 minutes of traffic).
+## 📊 Performance & Experiments
+
+Experiments are logged in `docs/notes.txt`.
+*   **Current Best Approach**: DeepESN with ~10-15 layers, low spectral radius, and block-based sequence processing.
+*   **Challenges**: Severe class imbalance (dominated by "Free Flowing") and variable sequence lengths.
+*   **Metrics**: We optimize for **Macro F1 Score** to ensure performance across all congestion levels, strict adherence to the no-backprop rule.
 
 ## 📝 License
 This project is licensed under the Apache 2.0 License.
