@@ -1,0 +1,446 @@
+28/12/2025 --------------------------------------------------------
+
+- building a mediapipe program to analyze the video and detect all the cars in the frame, then count the cars
+in each frame and classify the density.
+
+- analyzing the videos for the objects appearing in the frames, and counting how many are there in 
+comparision to the label assigned to the video.
+
+- will be inspecting the videos to see if the objects are in the frames and if they are fully being detected
+and reported by the program.
+
+29/12/2025 -------------------------------------------------------
+
+- will use the 0.57 as a probability threshold to count the objects in the videos, which will be 
+most reasonable considering the distance of the camera whicl any valuse in the range (0.5 - 0.6) can
+give a good result.
+
+- given that the videos are more than 16K in number, the resources and time available will not be 
+sufficient to include them all in the training process, so from that will analyze each one of the 
+4 sets.
+
+- the analysis will be done on each of the entrances separatly then the results will be compared and 
+a model with the concatenated performance get delivered.
+
+- the approach will be training a model on the first enterance and fine-tuning it in the other there
+each one separatly.
+
+- whether will be using keras to build a classification model or work with mediapipe to build an
+object detector and counter, then thinking that they are looking for classification scores 
+means incorporating the object detector in building a better classifier might give a great 
+advantage to the end to end system.
+
+- but one approach is to take the video label as the single ground truth and classify each frame. and the 
+video class get calculated as the mean of the frame classification.
+
+- for object detection will use the the efficientnet0 float16 model to run on gpu with reasnable latancy
+
+31/12/2025 -------------------------------------------------------
+
+- it will not be useful to implement a mediapipe classifier because it will not be able to  understand the scene 
+probabily because the object detector is not able to distinguish the objects in the frame but confuse the 
+road signs and colors with the vehicles.
+
+- the first idea is to detect objects in the videos and create files with the density at the entrance and exit
+added to that file the video name and the dictionary of the counts of the objects.
+
+- starting by downloading each video to colab and detecting the objects in and building a csv file for each 100 videos.
+as the table shows:
+
+|running|finished|remaining|
+|--------|---------|---------|
+|0:100    |0    |14000    |
+|0       | 100| 14900    |
+
+- then will compare the counts of the objects in the videos with the labels assigned to them, while detecting the 
+location of the vehicle wheather it is in the entrance or the exit by finding the dimentions of the bounding box 
+and if it is on the left half of the frame or the right half.
+
+- in the submission file the target and the target_accuracy are equal and repeating the result in two columns 
+is helpful for the competition to calculate the metrics of the submission.
+
+1/1/2026 -------------------------------------------------------
+
+- after recording the first 100 videos and analyzing the results, it was found that the it is not useful to 
+record all the videos given the large number of them, so will be checking for the four groups: free flow, 
+light delay, moderate delay, heavy delay. and will be recording 100 videos for each group. aiming for 
+clarity of a threshold range for each one.
+
+- check the four enterances if they are all with the left side as enterance and the right side as exit. and for that 
+will check the videos 4019-4021 and 12057-12060.
+
+05/01/2026 -------------------------------------------------------
+
+- given that the video processing operation is time consuming and take alot of efort then picking a group of videos
+for each enteraance is the best option. these groups will be picked based on:
+    - time of the day
+    - the density of the traffic according to the label assigned to the video
+    - the location of the enteraance
+
+- to have all the traffic densities in considerable counts as in the train.csv file, will use the first 1500 videos. 
+
+07/01/2025 -------------------------------------------------------
+
+- detecting the object in the first 1500 videos which showing the traffic for a single day in a single entrance,
+shows a clear pattern for the traffic upper and lower bounds in the video, with regards to the labels given.
+and as int he table:
+
+
+| Index | Camera ID | Rating Numeric | Mean | Variance | Count | Min Observed | Max Observed | Rating Label | Std Dev | Lower Bound | Upper Bound | Min Vehicles File | Max Vehicles File |
+|-------|-----------|----------------|------|----------|-------|--------------|--------------|--------------|---------|-------------|-------------|-------------------|-------------------|
+| 0 | NaN | 0 | 38.970000 | 1696.837475 | 100 | 0 | 225 | free flowing | 41.192687 | 0 | 80 | NaN | NaN |
+| 1 | normanniles1 | 0 | 578.903602 | 281149.181578 | 944 | 0 | 2342 | free flowing | 530.235025 | 49 | 1109 | normanniles1_2025-10-22-06-46-45.mp4 | normanniles1_2025-10-21-12-43-45.mp4 |
+| 2 | normanniles1 | 1 | 1137.338235 | 181114.714379 | 136 | 13 | 3012 | light delay | 425.575745 | 712 | 1563 | normanniles1_2025-10-22-06-25-45.mp4 | normanniles1_2025-10-22-11-54-45.mp4 |
+| 3 | normanniles1 | 2 | 1222.958042 | 192977.392593 | 143 | 417 | 2570 | moderate delay | 439.291922 | 784 | 1662 | normanniles1_2025-10-20-14-27-45.mp4 | normanniles1_2025-10-20-11-31-45.mp4 |
+| 4 | normanniles1 | 3 | 1382.380368 | 188494.953192 | 163 | 4 | 2757 | heavy delay | 434.160055 | 948 | 1817 | normanniles1_2025-10-21-12-10-45.mp4 | normanniles1_2025-10-22-12-02-45.mp4 |
+
+- start working on building a classifier for the videos with keras.
+
+- by experiment find that the maximum capacity of the resources on colab is 10000 videos, but in this 
+case the training time will be too long, so will be using a smaller number of videos to train the model, starting
+with 4000 per experiment to include each enterance in an iteration then fine-tuning the model on the other enterances.
+
+10/01/2026 -------------------------------------------------------
+
+- for best model 1 which was trained on 2000 videos for 1 epoch the metrics were:
+entrance_output_accuracy: 0.7862 - entrance_output_loss: 0.6817 - exit_output_accuracy: 0.9712 -
+exit_output_loss: 0.1503 - loss: 0.8320 - val_entrance_output_accuracy: 0.7950 -
+val_entrance_output_loss: 0.6569 - val_exit_output_accuracy: 0.9725 - val_exit_output_loss: 0.1507 -
+val_loss: 0.8076
+
+- after noting that the competition requires that the training and inference must not use backpropagation
+changed to use the leaner regression which does not help alot then implemented the forward-forward neural network.
+
+- signaling feature Meaning: In the context of traffic analysis, this likely represents the frequency of 
+vehicle light signals (such as turn signals, brake lights, or hazard lights) or the level of activity 
+from traffic control signals detected in the frame.
+Correlation with Congestion: Based on a cross-tabulation of the data:
+    - When signaling is none, traffic is predominantly free flowing.
+    - As the signaling level increases to medium or high, the likelihood of moderate or 
+    heavy delay increases significantly.
+
+- submitting the ff_restructured result to the competition resulted 0.40 score.
+
+- training the network for a 100 emochs does not show an improvement from 0.65 loss and was worse on the 
+leaderboard, so first will improve the compiler by changing the optimizer and set a loss function
+
+- the thirdrun with loss function and optimizer showed better performance in the last 5 epochs from the 100
+so will extend the training to 150 epochs and see if it improves further then try adding validation set.
+
+- the third submission which took 200 epochs made 41 on the leaderboard, so looked for randomness and could not spot any
+then added two more layers to the network to train a total of four layers
+
+- the fourth submission was much below expectation so adding the validation set and training for 500 epochs and 
+adding the accuracy and f1-score metrics is included for the next steps, in addition to adding kernel regularizer for the 
+model layers and changing the prediction window to better fit the requirements, and added seeds to remove randomness.
+next will consider adding classes weights for the model to understand the imbalance betweene the classes.
+
+- to increase the stability of the model metrics added the ema momentum to the optimizer. and included the 
+precision and recall in the evaluation.
+
+- the fifth submission resulted in improvement to 46% accuracy score on the leaderboard. now will add weights.
+
+11/01/2026 -----------------------------------------------------
+
+- the weights improved the training loss but not anything else. so will start running the hyperband because 
+not having ideas for tuning.
+
+- need to use the focal loss instead of mse since I am classifying and not only predicting the future.
+
+- after noticing that a score of 46% will result from submitting a list of free flow trafic full submit. 
+conducted the following additions:
+    - Shift to 4-Class Classification: Pivot from 16 combined (enter/exit) classes to only the 4 congestion_enter_rating classes, simplifying the gradient-free learning task.
+    - Reduced Label Overlay Buffer: Scaled down the input overlay from 16 dimensions to 4 dimensions, making the first layer's input vector much more efficient.
+    - Balanced Class Sampling: Implemented tf.data.Dataset.sample_from_datasets to ensure the model sees "heavy delay" samples as often as "free flowing" samples in every batch.
+    - Signaling Feature Engineering: Integrated the signaling data (none/low/medium/high) as a one-hot encoded feature, increasing the contextual input to 17 dimensions.
+
+- until submission 9 were exploring the edges of the assessment platform and now run the hyperband 
+
+- the best values to the hyperband were which gets a val-f1 score of 37 are:
+
+Value             |Best Value So Far |Hyperparameter
+3                 |num_layers
+256               |units
+0.00034787        |learning_rate
+1.143             |threshold
+1.0337            |gamma
+54                |layer_epochs
+2.8685e-05        |l2_reg
+4                 |tuner/epochs
+0                 |tuner/initial_epoch
+1                 |tuner/bracket
+0                 |tuner/round
+None              |tuner/trial_id
+
+
+- now paying attention to the fact that the data is sequential, set the sequence length and remove the sampling 
+of the data and remove the shuffling 
+
+- after making more edits to the code and taking the sequence into consideration and adding learning rate schedule
+the hyperband search came up with the following results for 40% f1-score:
+
+2                 |num_layers
+256               |units
+0.00074289        |learning_rate
+1.0395            |threshold
+2.4788            |gamma
+43                |layer_epochs
+1.5576e-05        |l2_reg
+1                 |ema_overwrite_frequency
+4                 |tuner/epochs
+2                 |tuner/initial_epoch
+2                 |tuner/bracket
+1                 |tuner/round
+
+13/01/2026 -----------------------------------------------------
+- after removing the normalization and boosting the label size looking for improvement in the performance, did get 
+a more understandable and stable performance, but no improvement in the metrics was noticed.
+
+- so reflecting on the fact that the number of features of the data are so limited, tested with narrowing the model by 
+decreasing the number of units in the layers, and enlongating the model by adding more layers.
+
+- this last change showed significant improvement by having the training accuracy reach more than 60% and training f1-score
+more than 40% while for the validation metrics it showed 59%% accuracy and 35% f1-score, which is also great in comparision.
+and it is obvious now that longer training epochs will give better performance metrics.
+
+- moving forward will consider changing the last layer of the model activation function to softmax 
+
+- checking the metrics values find that the precision and recall are always equal and similar to the accuracy. so
+changed them into a simple implementation instead of the keras function.
+
+- and changing the data pipeline into polars for the kaggle script to spped up the dataset loading.
+
+- by inspecting the metrics resulting from training the model on kaggle find that the best metrics are at the 30th epoch
+and after that the metrics started to drop, so continuing from there to 300 epochs might not be a good idea, but will keep
+going for now.
+
+- changed the kaggle version of the network to load the dataset with polars
+
+- after these improvement the submission 11 resultd in 51% accuracy.
+
+15/01/2026 -----------------------------------------------------
+
+- added model saving and serialization to the model and the other functions in the ff-restructured kernel.
+
+- now running the hyperband search to find the best parameters for the model, and without finishing due to the 
+lack of memory the best run was:
+
+Best Value So Far |Hyperparameter
+10                |num_layers
+64                |units
+0.0090513         |learning_rate
+60                |layer_epochs
+3.6               |threshold
+1.3               |gamma
+0.00079024        |l2_reg
+1                 |ema_overwrite_frequency
+2                 |tuner/epochs
+0                 |tuner/initial_epoch
+2                 |tuner/bracket
+0                 |tuner/round
+
+- Submission 13 with leaderboard score of 55 has the metrics: acc: 0.6016 - f1: 0.4276 - loss: 0.3779 - precision: 0.4424 - recall: 0.4827 - val_acc: 0.5120 - val_f1: 0.3753 - val_loss: 0.3957 - val_precision: 0.4303 - val_recall: 0.4252
+
+- submission 14 has the metrics: acc: 0.6073 - f1: 0.4407 - loss: 0.3682 - precision: 0.4551 - recall: 0.4922 - val_acc: 0.5906 - val_f1: 0.3294 - val_loss: 0.3805 - val_precision: 0.3110 - val_recall: 0.4071
+
+- submission 15 metrics: 168/168 - 8s - 49ms/step - acc: 0.6114 - f1: 0.4542 - loss: 0.3681 - precision: 0.4613 - recall: 0.5033 - val_acc: 0.5606 - val_f1: 0.3733 - val_loss: 0.3820 - val_precision: 0.4222 - val_recall: 0.4203
+
+
+17/01/2026 -------------------------------------------------
+
+- found the layers of the model normalized which means possibily one of the agents autonomously did that, which reduces the quality of the
+validation and results significantly.
+
+- realized that hyperband will not work for this project since it takes too much memory for the laptop and kaggle and it is 
+probably not compatible to TPU.
+
+- added layers early stopping and dropout to the network and fine tuning the threshold and the ema_overwrite_frequency can improve the 
+training accuracy enormously.
+
+- now for the ff-restructured.py switched the loss function from the mean to the categorical focal loss which was not expected to be that at this stage.
+
+18/01/2026 ---------------------------------------------------
+
+- found that the labels are not being loaded correctly.
+
+19/01/2026 --------------------------------------------------
+
+- the labels are correct but the network is plateau and Claude Opus explain that it is backpropagating and not a forward-forward network any more since it is using softmax and categorical focal crossentropy.
+
+- so working with gemini suggestions, created the ESM and ELM which is one for the sequential data in a forward-forward propagation and single layer network and the second is similar to the hinton network by 
+working with flattened data, so esm is favorite although elm showed better peak performance.
+
+- and all the previous and new networks are not improving over the 50% f1-score and the submission is not moving forward.
+
+20/01/2026 ---------------------------------------------
+
+- after observing that the data sequences have a giant variation in size ranging from 46 to more than 1000 elements, decided to chunk the sequence into smaller blocks with max of 100.
+
+- visualizing the traffic congestion rate against the time of the day, shows that there is a big fluctuation so tried averaging each 10 minutes in one dot on the plot and train the esm on the resulting data but it is still not doing better in submission score.
+
+- after finding that the information in the time of the videos and the train.csv datasheet is not sufficient to train any network and make it produce any better than 57% score so turned into the videos again.
+
+- built the mobilenet-esn model to classify the video traffic congestion and predict the future rate but did not get 
+acceptable performance so will experiment with larger models and tune the parameters since the design looks promising.
+
+23/01/2026 -----------------------------------------------
+
+- after finding that mobilenet does not help and adding pca with a reasonable reservoir and input image size will not be possible because of the resource limits.
+
+- stopped with the images and turned back to the train.csv file with deep esn and from the research paper find that tunning the deep esn network happens as follows:
+    * tune one parameter at a time
+    * start with:
+        = tune spectral radius
+        = leak-rate
+        = reservoir dimension
+        = number-of-layers
+        = averaging, ridge regularization, weights.
+
+- Experiments:
+    - ex_one:
+        > spectral_radius (0.9) --> Validation Accuracy: 0.5106, Validation F1-Macro: 0.3500 (54 submit score)
+        > spectral_radius (0.2) --> Validation Accuracy: 0.3191, Validation F1-Macro: 0.2672
+        > spectral_radius (0.5) --> Validation Accuracy: 0.3191, Validation F1-Macro: 0.3050 the confusion matrix all have values and nothing is dropped.
+        > spectral_radius (0.8) --> Validation Accuracy: 0.5319, Validation F1-Macro: 0.4745 (53 submit score) (fixed)
+        > spectral_radius (0.7) --> Validation Accuracy: 0.5319, Validation F1-Macro: 0.4626 
+    ---------------------------------------------------------------------------------------------
+        > leak_rate (0.2) --> Validation Accuracy: 0.4255, Validation F1-Macro: 0.3137
+        > leak_rate (0.5) --> Validation Accuracy: 0.4894, Validation F1-Macro: 0.3514
+        > leak_rate (0.9) --> Validation Accuracy: 0.3191, Validation F1-Macro: 0.2298
+        > leak_rate (0.3) --> Validation Accuracy: 0.5319, Validation F1-Macro: 0.4745 (fixed)
+        > leak_rate (0.4) --> Validation Accuracy: 0.5319, Validation F1-Macro: 0.4365 (53 submit score)
+        > leak_rate (0.35) --> Validation Accuracy: 0.5319, Validation F1-Macro: 0.4467
+    ----------------------------------------------------------------------------------------------
+        > num_layers (9) --> Validation Accuracy: 0.4681, Validation F1-Macro: 0.3776
+        > num_layers (5) --> Validation Accuracy: 0.5957, Validation F1-Macro: 0.5265 (57 submit score)
+        > num_layers (2) --> Validation Accuracy: 0.5319, Validation F1-Macro: 0.4745
+        > num_layers (3) --> Validation Accuracy: 0.4681, Validation F1-Macro: 0.3607
+        > num_layers (4) --> Validation Accuracy: 0.5957, Validation F1-Macro: 0.3643
+        > num_layers (15) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5820 (55 submit score)(fixed)
+        > num_layers (30) --> Validation Accuracy: 0.4894, Validation F1-Macro: 0.3142
+        > num_layers (14) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5763 (56 submit score)
+        > num_layers (16) --> Validation Accuracy: 0.5957, Validation F1-Macro: 0.3810
+        > num_layers (13) --> Validation Accuracy: 0.5532, Validation F1-Macro: 0.3599
+        > num_layers (12) --> Validation Accuracy: 0.4894, Validation F1-Macro: 0.2881
+    -----------------------------------------------------------------------------------------------
+        > res_dim (1000) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5820 (55 submit score)(fixed)
+        > res_dim (500) --> Validation Accuracy: 0.4894, Validation F1-Macro: 0.4187
+        > res_dim (2000) --> Validation Accuracy: 0.5532, Validation F1-Macro: 0.3689
+        > res_dim (3000) --> Validation Accuracy: 0.5745, Validation F1-Macro: 0.3856
+        > res_dim (1100) --> Validation Accuracy: 0.4043, Validation F1-Macro: 0.2539
+        > res_dim (1200) --> Validation Accuracy: 0.5532, Validation F1-Macro: 0.4955
+        > res_dim (1300) --> Validation Accuracy: 0.5106, Validation F1-Macro: 0.3049
+        > res_dim (900) --> Validation Accuracy: 0.5532, Validation F1-Macro: 0.3582
+        > res_dim (800) --> Validation Accuracy: 0.5319, Validation F1-Macro: 0.3395
+    ------------------------------------------------------------------------------------------------
+        > ridge_alpha (10) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5820
+        > ridge_alpha (100) --> Validation Accuracy: 0.5957, Validation F1-Macro: 0.5201
+        > ridge_alpha (200) --> Validation Accuracy: 0.5745, Validation F1-Macro: 0.5039
+        > ridge_alpha (5) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5820
+        > ridge_alpha (15) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5826
+        > ridge_alpha (14) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5826
+        > ridge_alpha (16) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5826
+        > ridge_alpha (17) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5845 (56 submit score)
+        > ridge_alpha (18) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5845
+        > ridge_alpha (19) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5845
+        > ridge_alpha (20) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5845 
+        > ridge_alpha (50) --> Validation Accuracy: 0.5957, Validation F1-Macro: 0.5546
+    -------------------------------------------------------------------------------------------------
+        > state_noise (0.01) --> Validation Accuracy: 0.6596, Validation F1-Macro: 0.4495
+        > state_noise (0.1) --> Validation Accuracy: 0.6383, Validation F1-Macro: 0.4375
+        > state_noise (0.15) --> Validation Accuracy: 0.6383, Validation F1-Macro: 0.4063
+        > state_noise (0.2) --> Validation Accuracy: 0.5532, Validation F1-Macro: 0.3141
+        > state_noise (0.3) --> Validation Accuracy: 0.5319, Validation F1-Macro: 0.2745
+    -------------------------------------------------------------------------------------------------
+        > block_size (50) --> Validation Accuracy: 0.6596, Validation F1-Macro: 0.4495
+        > block_size (40) --> 
+
+25/01/2026 ----------------------------------------------------
+
+- paying attention to the fact that the model is overfitting the data and always have a 100% in the training scores and 
+the validation accuracy is capped by 61.70%, so using a smaller model that will less fit the data will be reasonable.
+
+- Experiments:
+    - ex_two:
+        > num_layers (10) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.4104
+        > num_layers (5) --> Validation Accuracy: 0.5745, Validation F1-Macro: 0.3575
+        > num_layers (6) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5433 (fixed for the reasonable training performance) 
+        > num_layers (4) --> Validation Accuracy: 0.4788, Validation F1-Macro: 0.3445
+    ---------------------------------------------------------------------------------------------
+        > block_size (50) --> Validation Accuracy: 0.6170, Validation F1-Macro: 0.5433
+        > block_size (5) --> Validation Accuracy: 0.5575, Validation F1-Macro: 0.3978 (58 submit score)
+        > block_size (6) --> Validation Accuracy: 0.5377, Validation F1-Macro: 0.3841
+        > block_size (10) --> Validation Accuracy: 0.5931, Validation F1-Macro: 0.4840
+        > block_size (15) --> Validation Accuracy: 0.5195, Validation F1-Macro: 0.4115
+        > block_size (20) --> Validation Accuracy: 0.6034, Validation F1-Macro: 0.4462
+        > block_size (14) --> Validation Accuracy: 0.5394, Validation F1-Macro: 0.3598 (fixed on this becasue it will fit the submission test data)
+    ----------------------------------------------------------------------------------------------
+        > ridge_alpha (10) --> Validation Accuracy: 0.4909, Validation F1-Macro: 0.3532
+        > ridge_alpha (5) --> Validation Accuracy: 0.4848, Validation F1-Macro: 0.3405
+    ---------------------------------------------------------------------------------------------
+        > res_dim (900) --> Validation Accuracy: 0.6121, Validation F1-Macro: 0.3813
+
+================================================================================
+Date: 2026-05-28
+================================================================================
+- Generated a 50-page academic book in LaTeX format (book.pdf) expanding on the Forward-Pass Only DeepESN research paper for Eliva Press publication. The book includes 8 chapters detailing theoretical foundations, feature engineering, DeepESN/Forward-Forward implementations, and experimental results based on the codebase and literature.
+
+
+2026-05-30 -----------------------------------------------------------------------------------------------
+
+- add the autonmous driving to the book to have a more complete perispective and more informative product.
+
+2026-05-31 -----------------------------------------------------------------------------------------------
+
+- add more interesting and important information about the models and types of networks used, which can be found from research papers, thesis and experience.
+
+- add more friendly language and make the book sound like a story to make it more fun.
+
+- Included ESN optimization tips and best practices from Lukosevicius (2012) into Chapter 6 of the book.
+
+- Defined prerequisites and target audience in the Introduction chapter (Ch01). Refined chapter structure to include foundational knowledge requirements.
+
+- Added 'Software Environment' section to the Introduction (Ch01) detailing primary library versions for reproducibility.
+
+- Restructured Software Environment table in Introduction (Ch01) to prevent layout collisions.
+
+
+2026-06-01 
+----------------------------------------------------------------------------------------------
+
+- I need to elaborate on the second chapter and the forward-forward network by more details about the structure , training process and the experiments done during the project.
+
+- need to reformat chapter 3 based on the face that the train.csv datasheet is a labes sheet and not a compresssed version of the original dataset.
+
+- adding the identity blocks function in 5.3 chapter is not relevant because it is not of big importance and complexity so should remove it and replace it with a code for other pars and preferabily of the ESN model.
+
+- add a part for productionizing and scaling the model to deploy it in reallity after finishing the research and the experimentation.
+
+- Maintain a predictable rhythm across chapters to help readers digest complex technical concepts:
+
+    The Objective: What problem are we solving?
+
+    The Intuition/Theory: The conceptual or mathematical breakdown (using clean diagrams or equations where necessary).
+
+    The Code/Implementation: Clean, commented walkthroughs.
+
+    The Edge Cases/Pitfalls: Real-world debugging, convergence issues, or hardware bottlenecks.
+
+    Summary & Exercises: To reinforce learning.
+
+- verify that all the published code is running.
+
+- --------------------------------------------------------------------------------
+Tuesday, June 2, 2026
+Created a new version of the research book: 'Intelligent Urban Mobility: Integrating Deep Echo State Networks and Infrastructure-Assisted Autonomous Driving'.
+Merged traffic congestion detection with autonomous driving concepts, adding three new chapters on AV challenges, collaborative perception (VICAD), and an integrated perception framework.
+Incorporated research from 'Challenges and solutions of autonomous driving approaches: A review' (Attrah, 2025) and 'A Practical Guide to Applying Echo State Network' (Lukoševičius, 2012).
+--------------------------------------------------------------------------------
+Date: 2026-06-06
+- Summary: Shortened the preface of book_v2 by one line in book.tex to improve layout of author signature.
+- Summary: Compiled book.tex to update book.pdf after preface shortening.
+- Summary: Removed a sentence from the preface of book_v2 in book.tex and recompiled to update book.pdf.
+
+2026-06-07 --------------------------------------------------------------------------
+
+- the repository need to be mentioned in the book and it has to get a restructuring and maybe a new name.
