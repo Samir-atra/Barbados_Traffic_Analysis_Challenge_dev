@@ -1,5 +1,8 @@
 # Barbados Traffic Analysis Challenge 🚗🚦
 
+This repository for the research paper: [Forward-Pass Only Deep Echo State Networks for Trac Congestion Prediction: A Case Study on the Barbados Trac Analysis Challenge](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6730183)
+And soon a book will be published with more!
+
 This repository contains the solution for the [Barbados Traffic Analysis Challenge](https://zindi.africa/competitions/barbados-traffic-analysis-challenge). The goal is to predict traffic congestion levels (4 classes) for the next 8 time segments based on historical traffic patterns and signaling states.
 
 **Key Constraint**: The competition requires that the training and inference models **must not use backpropagation**. This repository explores alternative learning paradigms like **Echo State Networks (ESN)**, **Extreme Learning Machines (ELM)**, and **Forward-Forward (FF)** algorithms.
